@@ -34,6 +34,7 @@ ctest --test-dir build-asan --output-on-failure
 - Optional authentication-only data records (HMAC-SHA-256) when both peers set `min_protection` to authenticated. `ps_send` stays confidential. `ps_send_protected` selects the profile for one buffer. The library copies that buffer.
 - Ordered reassembly, absolute receive windows, and a generation-based rekey
 - A blocking `ps_connect` / `ps_send` / `ps_recv` API
+- A header-only C++17 wrapper in `include/parsock.hpp` (`parsock::options`, `connection`, `listener`, `session`)
 - An embedded readiness API (`ps_on_readable`, `ps_on_writable`, `ps_embed_service`) for an external poller
 - Optional crypto worker threads, independent of the socket count
 
@@ -71,9 +72,21 @@ To carry a public response body without payload encryption, both processes pass 
 ./build/spt_http client cert.pem key.pem 127.0.0.1 <port> 1048576 public
 ```
 
+Benchmark between two machines. Use the same `--aead`, `--sockets`, and `--protection` on both ends. Authenticated mode keeps the payload in plaintext and still authenticates every record.
+
+```sh
+./build/spt_bench server --cert cert.pem --key key.pem --bind 0.0.0.0 --port 8443 \
+    --aead aes-256-gcm --sockets 4 --protection confidential
+./build/spt_bench client 192.168.1.10 8443 --cert cert.pem --key key.pem \
+    --aead aes-256-gcm --sockets 4 --protection confidential --bytes 8G
+```
+
+A terminal shows transmit and receive rate, with a sparkline of about the last minute. Redirected output is CSV. `--send` and `--recv` move files in either direction at the same time. `spt_bench suite` repeats confidential AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305, plus authenticated HMAC, on loopback.
+
 ## Layout
 
-- `include/parsock.h` — application API
+- `include/parsock.h` — C application API
+- `include/parsock.hpp` — header-only C++17 wrapper
 - `include/spt_wire.h` — experimental wire codec and key schedule
 - `src/session.c` — protocol core
 - `src/drive.c` — TLS pump and readiness entry points

@@ -655,7 +655,7 @@ ps_connection_t *ps_connect(const char *host, uint16_t port, const struct ps_opt
 ssize_t ps_send(ps_connection_t *conn, const void *buffer, size_t length)
 {
     if (!conn)
-        return -1;
+        return -PS_ERR_INVAL;
     return ps_session_send_wait(conn->session, buffer, length, SPT_PROTECTION_CONFIDENTIAL,
                                 conn->io_timeout_ms);
 }
@@ -664,7 +664,7 @@ ssize_t ps_send_protected(ps_connection_t *conn, const void *buffer, size_t leng
                           ps_protection_t protection)
 {
     if (!conn)
-        return -1;
+        return -PS_ERR_INVAL;
     return ps_session_send_wait(conn->session, buffer, length, (uint8_t)protection,
                                 conn->io_timeout_ms);
 }
@@ -672,18 +672,16 @@ ssize_t ps_send_protected(ps_connection_t *conn, const void *buffer, size_t leng
 ssize_t ps_recv(ps_connection_t *conn, void *buffer, size_t length)
 {
     if (!conn)
-        return -1;
+        return -PS_ERR_INVAL;
     return ps_session_recv_wait(conn->session, buffer, length, conn->io_timeout_ms);
 }
 
 int ps_shutdown(ps_connection_t *conn, int how)
 {
     if (!conn)
-        return -1;
-    if (how == SHUT_RDWR || how == SHUT_WR) {
-        int rc = ps_session_shutdown_write(conn->session);
-        return rc == 0 ? 0 : -1;
-    }
+        return -PS_ERR_INVAL;
+    if (how == SHUT_RDWR || how == SHUT_WR)
+        return ps_session_shutdown_write(conn->session);
     return 0;
 }
 

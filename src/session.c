@@ -2671,7 +2671,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
                              uint8_t protection, uint32_t timeout_ms)
 {
     if (!session || (!buf && len))
-        return -1;
+        return -PS_ERR_INVAL;
     const uint8_t *p = (const uint8_t *)buf;
     size_t left = len;
     int fatal = PS_OK;
@@ -2728,7 +2728,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
             session->err = fatal;
             unlock_s(session);
         }
-        return -1;
+        return -fatal;
     }
     return (ssize_t)(len - left);
 }
@@ -2737,7 +2737,7 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
                              uint32_t timeout_ms)
 {
     if (!session || (!buf && len))
-        return -1;
+        return -PS_ERR_INVAL;
     ps_session_progress(session);
     struct timespec ts;
     int use_deadline = timeout_ms != UINT32_MAX;
@@ -2753,7 +2753,7 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
             session->in_user_read = 0;
             session->err = err;
             unlock_s(session);
-            return -1;
+            return -err;
         }
         size_t n = spt_reassembly_consume(&session->reassembly, (uint8_t *)buf, len);
         if (n > 0) {
@@ -2778,7 +2778,7 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
             session->in_user_read = 0;
             session->err = PS_ERR_TIMEOUT;
             unlock_s(session);
-            return -1;
+            return -PS_ERR_TIMEOUT;
         }
     }
 }

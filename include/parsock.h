@@ -151,11 +151,14 @@ void ps_listener_close(ps_listener_t *listener);
 int ps_listener_port(const ps_listener_t *listener, uint16_t *control_port,
                      uint16_t *data_port);
 
+/* Byte count on success. A negative return is -PS_ERR_*. The library copies
+   the buffer. A rejected profile does not fail the connection. */
 ssize_t ps_send(ps_connection_t *conn, const void *buffer, size_t length);
 /* Copies the buffer. Authenticated sends succeed only when both peers set
    min_protection to PS_PROTECTION_AUTHENTICATED. */
 ssize_t ps_send_protected(ps_connection_t *conn, const void *buffer, size_t length,
                           ps_protection_t protection);
+/* Byte count, 0 at end of stream, or a negative -PS_ERR_* code. */
 ssize_t ps_recv(ps_connection_t *conn, void *buffer, size_t length);
 int ps_shutdown(ps_connection_t *conn, int how);
 int ps_close(ps_connection_t *conn);
