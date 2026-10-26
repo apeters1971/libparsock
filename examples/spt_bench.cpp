@@ -89,6 +89,7 @@ struct meter {
     std::atomic<std::int64_t> rx_end_ns{0};
     std::atomic<unsigned> sockets{0};
     std::atomic<std::uint32_t> rtt_us{0};
+    std::atomic<std::uint32_t> frame_bytes{0};
     std::atomic<int> workers_left{2};
     std::atomic<bool> finished{false};
 };
@@ -872,9 +873,11 @@ struct chart {
         const std::uint64_t rx = stats.rx.load();
         const std::uint64_t tx_expect = stats.tx_expect.load();
         const std::uint64_t rx_expect = stats.rx_expect.load();
+        const unsigned frame = stats.frame_bytes.load() ? stats.frame_bytes.load() : kFrame;
         std::cout << title << "   " << aead_name(cfg.cipher) << "   " << protection_name(cfg.protection)
-                  << "   " << stats.sockets.load() << " sockets   frame " << (kFrame / 1024)
-                  << " KiB   RTT " << stats.rtt_us.load() << " us\033[K\n";
+                  << "   " << stats.sockets.load() << " sockets   frame " << (frame / 1024)
+                  << " KiB   workers " << cfg.workers << "   RTT " << stats.rtt_us.load()
+                  << " us\033[K\n";
         std::cout << "tx   " << rate_text(history.empty() ? 0 : history.back().tx_gbps) << "   avg "
                   << rate_text(gbps_of(tx, stats.tx_start_ns.load(), now_ns())) << "   peak "
                   << rate_text(tx_peak) << "    " << bytes_text(tx);
@@ -917,6 +920,7 @@ void sample_loop(parsock::connection &conn, meter &stats, const config &cfg, con
             const parsock::stats live = conn.statistics();
             stats.sockets.store(live.active_sockets);
             stats.rtt_us.store(live.rtt_us);
+            stats.frame_bytes.store(live.frame_bytes);
         } catch (...) {
         }
         const std::uint64_t tx = stats.tx.load();

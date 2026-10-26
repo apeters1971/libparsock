@@ -170,36 +170,47 @@ static int lane_owns(const struct io_lane *lane, int fd)
     return m == lane->index;
 }
 
+static void lane_fill(struct io_lane *lane, int *read_again)
+{
+    struct ps_runtime *rt = lane->rt;
+    struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
+    int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
+    int again_left = 0;
+    for (int i = 0; i < nw; i++) {
+        if (!lane_owns(lane, watches[i].fd))
+            continue;
+        if (ps_session_is_control(rt->session, watches[i].fd))
+            continue;
+        int again = 0;
+        if (ps_session_ingest(rt->session, watches[i].fd, &again) < 0)
+            break;
+        if (again)
+            again_left = 1;
+    }
+    *read_again = again_left;
+}
+
 static void *runtime_main(void *arg)
 {
     struct io_lane *lane = (struct io_lane *)arg;
     struct ps_runtime *rt = lane->rt;
+    int read_again = 0;
     while (!rt->stop) {
-        for (int spin = 0; spin < 4 && !rt->stop; spin++) {
+        /* Opening and closing sockets is session-wide. One lane does it.
+           poll waits until the kernel can take or produce bytes. A zero
+           timeout spins every lane whenever a socket is writable, and that
+           steals the cores the checksum workers need. */
+        if (lane->index == 0)
             ps_embed_service(rt->session);
-            ps_session_progress(rt->session);
-            struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
-            int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
-            for (int i = 0; i < nw; i++) {
-                if (!lane_owns(lane, watches[i].fd))
-                    continue;
-                if (watches[i].want_write)
-                    ps_on_writable(rt->session, watches[i].fd);
-            }
-            if (!ps_session_local_pending(rt->session))
-                break;
-            nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
-            for (int i = 0; i < nw; i++) {
-                if (!lane_owns(lane, watches[i].fd))
-                    continue;
-                if (watches[i].want_read)
-                    ps_on_readable(rt->session, watches[i].fd);
-            }
-            if (!ps_session_local_pending(rt->session))
-                break;
-        }
+        /* One checksum per pass so the other lanes can take the rest.
+           Worker threads leave this queue empty and the lane blocks in poll. */
+        ps_session_progress_step(rt->session);
         if (rt->stop)
             break;
+        if (read_again)
+            lane_fill(lane, &read_again);
+        if (ps_session_inline_pending(rt->session))
+            continue;
         struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
         int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
         struct pollfd pfds[PS_MAX_SUBFLOWS + 3];
@@ -211,22 +222,20 @@ static void *runtime_main(void *arg)
         for (int i = 0; i < nw; i++) {
             if (!lane_owns(lane, watches[i].fd))
                 continue;
-            pfds[np].fd = watches[i].fd;
-            pfds[np].events = 0;
+            short ev = 0;
             if (watches[i].want_read)
-                pfds[np].events |= POLLIN;
+                ev = (short)(ev | POLLIN);
             if (watches[i].want_write)
-                pfds[np].events |= POLLOUT;
+                ev = (short)(ev | POLLOUT);
+            if (ev == 0)
+                continue;
+            pfds[np].fd = watches[i].fd;
+            pfds[np].events = ev;
             pfds[np].revents = 0;
             watches[np - 1] = watches[i];
             np++;
         }
-        int owned_ready = 0;
-        for (int i = 1; i < np; i++) {
-            if (pfds[i].events != 0)
-                owned_ready = 1;
-        }
-        int timeout = owned_ready ? 0 : ps_session_next_timeout_ms(rt->session);
+        int timeout = ps_session_next_timeout_ms(rt->session);
         int pr = poll(pfds, (nfds_t)np, timeout);
         if (rt->stop)
             break;
@@ -240,10 +249,24 @@ static void *runtime_main(void *arg)
             drain_wake(lane->wake_r);
         for (int i = 1; i < np; i++) {
             short ev = pfds[i].revents;
-            if (ev & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
-                ps_on_readable(rt->session, watches[i - 1].fd);
-            if (ev & POLLOUT)
-                ps_on_writable(rt->session, watches[i - 1].fd);
+            int fd = watches[i - 1].fd;
+            int control = ps_session_is_control(rt->session, fd);
+            if (ev & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+                if (control)
+                    ps_on_readable(rt->session, fd);
+                else {
+                    int again = 0;
+                    ps_session_ingest(rt->session, fd, &again);
+                    if (again)
+                        read_again = 1;
+                }
+            }
+            if (ev & POLLOUT) {
+                if (control || ps_session_is_connecting(rt->session, fd))
+                    ps_on_writable(rt->session, fd);
+                else
+                    ps_session_flush(rt->session, fd, 4u * 1024u * 1024u);
+            }
         }
         if (lane->index == 0)
             ps_session_scale_tick(rt->session);

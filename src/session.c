@@ -74,6 +74,10 @@ struct wire_slot {
     struct wire_slot *next;
 };
 
+struct frame_cache {
+    struct frame_cache *next;
+};
+
 struct plain_slot {
     int ready;
     int ok;
@@ -207,6 +211,8 @@ struct ps_session {
     size_t frame_size;
     size_t recv_window;
     size_t sf_hi;
+    struct frame_cache *frames;
+    unsigned nframes;
     size_t max_poller_bytes;
     unsigned max_poller_records;
     uint16_t aead;
@@ -707,6 +713,34 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
+/* Caller holds the session lock. Full-size data frames are reused so the
+   send path does not page-fault a fresh buffer on every record. */
+static uint8_t *frame_get_locked(struct ps_session *s, size_t wire)
+{
+    size_t full = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (wire == full && s->frames) {
+        struct frame_cache *n = s->frames;
+        s->frames = n->next;
+        if (s->nframes)
+            s->nframes--;
+        return (uint8_t *)n;
+    }
+    return (uint8_t *)malloc(wire);
+}
+
+static void frame_put_locked(struct ps_session *s, uint8_t *frame, size_t wire)
+{
+    size_t full = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (frame && wire == full && s->nframes < 128) {
+        struct frame_cache *n = (struct frame_cache *)frame;
+        n->next = s->frames;
+        s->frames = n;
+        s->nframes++;
+        return;
+    }
+    free(frame);
+}
+
 static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
                                  uint8_t type, uint16_t flags, uint64_t logical,
                                  const uint8_t *plain, uint32_t plain_len,
@@ -742,11 +776,11 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     hdr.logical_offset = logical;
     hdr.plaintext_length = plain_len;
     size_t wire = spt_frame_wire_len(plain_len);
-    uint8_t *frame = (uint8_t *)malloc(wire);
+    uint8_t *frame = frame_get_locked(s, wire);
     struct wire_slot *slot = (struct wire_slot *)calloc(1, sizeof(*slot));
     struct crypto_job *job = (struct crypto_job *)calloc(1, sizeof(*job));
     if (!frame || !slot || !job) {
-        free(frame);
+        frame_put_locked(s, frame, wire);
         free(slot);
         free(job);
         fail_locked(s, PS_ERR_NOMEM);
@@ -774,7 +808,11 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     }
     job->seq = sf->send_seq;
     memcpy(job->aad, frame, SPT_FRAME_HEADER_LEN);
-    if (plain_len) {
+    if (plain_len && job->mac) {
+        memcpy(frame + SPT_FRAME_HEADER_LEN, plain, plain_len);
+        job->in = frame + SPT_FRAME_HEADER_LEN;
+        job->keep_in = 1;
+    } else if (plain_len) {
         job->in = (uint8_t *)malloc(plain_len);
         if (!job->in) {
             free_job(job);
@@ -1399,6 +1437,7 @@ static void handle_client_hello_locked(struct ps_session *s, const uint8_t *body
     }
     s->aead = ch.aead;
     s->frame_size = frame;
+    s->sf_hi = (size_t)frame * 16;
     s->max_sockets = cap;
     s->expect = want;
     s->send_limit = ch.recv_window;
@@ -1462,6 +1501,7 @@ static void handle_server_hello_locked(struct ps_session *s, const uint8_t *body
     memcpy(s->session_id, sh.session_id, SPT_SESSION_ID_LEN);
     s->have_server_hello = 1;
     s->frame_size = sh.frame_size;
+    s->sf_hi = s->frame_size * 16;
     s->max_sockets = sh.max_sockets < s->max_sockets ? sh.max_sockets : s->max_sockets;
     if (s->min_sockets > s->max_sockets)
         s->min_sockets = s->max_sockets;
@@ -1846,9 +1886,11 @@ static int eof_locked(const struct ps_session *s)
            s->reassembly.deliver == s->eos_off;
 }
 
-static void run_ready_work(struct ps_session *s)
+static void run_ready_work(struct ps_session *s, int limit)
 {
     for (int guard = 0; guard < 100000; guard++) {
+        if (limit == 0)
+            break;
         lock_s(s);
         if (s->state != PS_STATE_FAILED)
             apply_all_locked(s);
@@ -1873,7 +1915,13 @@ static void run_ready_work(struct ps_session *s)
         finish_job_locked(s, job, ok);
         free_job(job);
         unlock_s(s);
+        if (limit > 0)
+            limit--;
     }
+    lock_s(s);
+    if (s->state != PS_STATE_FAILED)
+        apply_all_locked(s);
+    unlock_s(s);
 }
 
 static void dispatch(struct ps_session *s)
@@ -1947,8 +1995,27 @@ void ps_session_progress(ps_session_t *session)
 {
     if (!session)
         return;
-    run_ready_work(session);
+    run_ready_work(session, -1);
     dispatch(session);
+}
+
+void ps_session_progress_step(ps_session_t *session)
+{
+    if (!session)
+        return;
+    run_ready_work(session, 1);
+    dispatch(session);
+}
+
+int ps_session_inline_pending(const ps_session_t *session)
+{
+    if (!session)
+        return 0;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    int yes = s->inline_head != NULL;
+    unlock_s(s);
+    return yes;
 }
 
 static void normalize(struct ps_session *s, const struct ps_options *in)
@@ -2001,7 +2068,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
     s->min_transfer_size = o.min_transfer_size;
     s->frame_size = o.frame_size;
     s->recv_window = o.receive_window;
-    s->sf_hi = o.frame_size * 4;
+    s->sf_hi = o.frame_size * 16;
     s->max_poller_bytes = o.max_poller_bytes;
     s->max_poller_records = o.max_poller_records;
     s->aead = (uint16_t)o.aead;
@@ -2041,7 +2108,7 @@ static void session_destroy(struct ps_session *s)
         while (sf->out_head) {
             struct wire_slot *w = sf->out_head;
             sf->out_head = w->next;
-            free(w->frame);
+            frame_put_locked(s, w->frame, w->len);
             free(w);
         }
         while (sf->in_head) {
@@ -2085,6 +2152,11 @@ static void session_destroy(struct ps_session *s)
     free(s->tids);
     if (s->ctx)
         SSL_CTX_free(s->ctx);
+    while (s->frames) {
+        struct frame_cache *n = s->frames;
+        s->frames = n->next;
+        free(n);
+    }
     pthread_cond_destroy(&s->job_cv);
     pthread_mutex_destroy(&s->job_mu);
     pthread_cond_destroy(&s->cv);
@@ -2613,7 +2685,7 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
                 if (sf->out_bytes >= slot->len)
                     sf->out_bytes -= slot->len;
                 session->records_tx++;
-                free(slot->frame);
+                frame_put_locked(session, slot->frame, slot->len);
                 free(slot);
                 try_end_locked(session, sf);
                 pthread_cond_broadcast(&session->cv);
@@ -2845,7 +2917,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
         if (failed)
             fatal = session->err ? session->err : PS_ERR_PROTO;
         unlock_s(session);
-        ps_session_progress(session);
+        ps_session_progress_step(session);
         if (n > 0) {
             p += n;
             left -= n;
@@ -2877,7 +2949,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
             left -= n;
         }
     }
-    ps_session_progress(session);
+    ps_session_progress_step(session);
     if (left == len && fatal) {
         if (fatal != PS_ERR_AUTH && fatal != PS_ERR_INVAL) {
             lock_s(session);
@@ -2894,7 +2966,7 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
 {
     if (!session || (!buf && len))
         return -PS_ERR_INVAL;
-    ps_session_progress(session);
+    ps_session_progress_step(session);
     struct timespec ts;
     int use_deadline = timeout_ms != UINT32_MAX;
     if (use_deadline) {
@@ -2917,7 +2989,7 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
             maybe_window_locked(session);
             session->in_user_read = 0;
             unlock_s(session);
-            ps_session_progress(session);
+            ps_session_progress_step(session);
             return (ssize_t)n;
         }
         if (eof_locked(session) || session->state == PS_STATE_CLOSED) {
@@ -3136,6 +3208,7 @@ static void fill_stats_locked(struct ps_session *s, struct ps_stats *out)
     out->rtt_us = s->rtt_us;
     out->peer_scale_request = s->peer_scale;
     out->last_error = s->err;
+    out->frame_bytes = (uint32_t)s->frame_size;
 }
 
 static void fill_advice_locked(struct ps_session *s, struct ps_scale_advice *out)

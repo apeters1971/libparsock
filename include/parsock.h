@@ -108,6 +108,7 @@ struct ps_stats {
     uint32_t rtt_us;
     uint32_t peer_scale_request;
     int last_error;
+    uint32_t frame_bytes;
 };
 
 struct ps_scale_advice {

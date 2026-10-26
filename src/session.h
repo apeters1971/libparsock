@@ -42,6 +42,8 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again);
 int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes);
 int ps_session_on_connected(ps_session_t *session, int fd);
 void ps_session_progress(ps_session_t *session);
+void ps_session_progress_step(ps_session_t *session);
+int ps_session_inline_pending(const ps_session_t *session);
 int ps_session_local_pending(const ps_session_t *session);
 int ps_session_next_timeout_ms(const ps_session_t *session);
 void ps_session_scale_tick(ps_session_t *session);
