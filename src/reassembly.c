@@ -34,27 +34,6 @@ void spt_reassembly_free(struct spt_reassembly *r)
     r->buffered = 0;
 }
 
-static void coalesce(struct spt_reassembly *r)
-{
-    struct spt_seg *p = r->head;
-    while (p && p->next) {
-        struct spt_seg *n = p->next;
-        if (p->off + p->len == n->off) {
-            uint8_t *grown = (uint8_t *)realloc(p->data, p->len + n->len);
-            if (!grown)
-                return;
-            p->data = grown;
-            memcpy(p->data + p->len, n->data, n->len);
-            p->len += n->len;
-            p->next = n->next;
-            free(n->data);
-            free(n);
-            continue;
-        }
-        p = p->next;
-    }
-}
-
 int spt_reassembly_insert(struct spt_reassembly *r, uint64_t off,
                           const uint8_t *data, size_t len)
 {
@@ -116,7 +95,6 @@ int spt_reassembly_insert(struct spt_reassembly *r, uint64_t off,
         data += room;
         len -= room;
     }
-    coalesce(r);
     return 0;
 }
 
@@ -124,7 +102,13 @@ size_t spt_reassembly_available(const struct spt_reassembly *r)
 {
     if (!r || !r->head || r->head->off != r->deliver)
         return 0;
-    return r->head->len;
+    size_t n = 0;
+    uint64_t at = r->deliver;
+    for (const struct spt_seg *s = r->head; s && s->off == at; s = s->next) {
+        n += s->len;
+        at += s->len;
+    }
+    return n;
 }
 
 size_t spt_reassembly_consume(struct spt_reassembly *r, uint8_t *dst, size_t cap)
