@@ -1,0 +1,5 @@
+build/
+build-asan/
+*.pem
+.DS_Store
+CMakeUserPresets.json
