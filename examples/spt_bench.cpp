@@ -60,6 +60,8 @@ struct config {
     bool hash = false;
     bool chart = true;
     bool open_ended = false;
+    std::uint64_t window = 512ull << 20;
+    bool verify = true;
     std::vector<unsigned> socket_list;
 };
 
@@ -258,7 +260,7 @@ void usage()
         << "      [--aead aes-128-gcm|aes-256-gcm|chacha20-poly1305]\n"
         << "      [--sockets N] [--workers N] [--protection confidential|authenticated]\n"
         << "      [--send FILE] [--recv FILE] [--bytes SIZE] [--seconds SEC]\n"
-        << "      [--hash] [--csv FILE] [--no-chart]\n"
+        << "      [--window SIZE] [--no-verify] [--hash] [--csv FILE] [--no-chart]\n"
         << "  spt_bench client HOST PORT [--cert CERT --key KEY] [same options]\n"
         << "  spt_bench suite --cert CERT --key KEY [--bytes SIZE] [--sockets 1,4,8]\n"
         << "      [--workers N] [--seconds SEC] [--csv FILE] [--no-chart]\n"
@@ -306,6 +308,10 @@ config parse_args(int argc, char **argv, std::vector<std::string> &positionals)
             cfg.seconds = std::stod(need_value(i, argc, argv, "--seconds"));
         else if (arg == "--csv")
             cfg.csv_path = need_value(i, argc, argv, "--csv");
+        else if (arg == "--window")
+            cfg.window = parse_size(need_value(i, argc, argv, "--window"));
+        else if (arg == "--no-verify")
+            cfg.verify = false;
         else if (arg == "--hash")
             cfg.hash = true;
         else if (arg == "--no-chart")
@@ -508,7 +514,7 @@ parsock::options make_options(const config &cfg, const std::string &server_name,
         .cipher(cfg.cipher)
         .minimum_protection(cfg.protection)
         .frame_size(kFrame)
-        .receive_window(64ull << 20)
+        .receive_window(cfg.window)
         .connect_timeout(10000)
         .io_timeout(300000);
     if (!server_name.empty())
@@ -556,7 +562,24 @@ void fill_pattern(std::uint8_t *dst, std::uint64_t offset, std::size_t n)
 
 bool pattern_matches(const std::uint8_t *src, std::uint64_t offset, std::size_t n)
 {
-    for (std::size_t i = 0; i < n; i++) {
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        std::uint64_t exp = 0;
+        std::uint8_t *p = reinterpret_cast<std::uint8_t *>(&exp);
+        p[0] = pattern_byte(offset + i);
+        p[1] = pattern_byte(offset + i + 1);
+        p[2] = pattern_byte(offset + i + 2);
+        p[3] = pattern_byte(offset + i + 3);
+        p[4] = pattern_byte(offset + i + 4);
+        p[5] = pattern_byte(offset + i + 5);
+        p[6] = pattern_byte(offset + i + 6);
+        p[7] = pattern_byte(offset + i + 7);
+        std::uint64_t act = 0;
+        std::memcpy(&act, src + i, 8);
+        if (act != exp)
+            return false;
+    }
+    for (; i < n; i++) {
         if (src[i] != pattern_byte(offset + i))
             return false;
     }
@@ -667,7 +690,7 @@ void send_direction(parsock::connection &conn, const config &cfg, meter &stats, 
         std::uint8_t header[20];
         std::memcpy(header, kMagic, 4);
         put_u64(header + 4, announced);
-        header[12] = generated ? kFlagPattern : 0;
+        header[12] = (generated && cfg.verify) ? kFlagPattern : 0;
         std::memset(header + 13, 0, 7);
         conn.send(header, sizeof(header), parsock::protection::confidential);
 
@@ -716,7 +739,7 @@ void recv_direction(parsock::connection &conn, const config &cfg, meter &stats, 
         if (std::memcmp(header, kMagic, 4) != 0)
             throw std::runtime_error("unexpected stream preamble");
         const std::uint64_t announced = get_u64(header + 4);
-        const bool check_pattern = (header[12] & kFlagPattern) != 0;
+        const bool check_pattern = cfg.verify && ((header[12] & kFlagPattern) != 0);
         if (announced != kUntilEof)
             stats.rx_expect.store(announced);
 

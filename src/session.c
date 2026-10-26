@@ -286,6 +286,8 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
                                  uint8_t protection);
 static void send_eos_locked(struct ps_session *s);
 static void send_protection_locked(struct ps_session *s);
+static void apply_all_locked(struct ps_session *s);
+static void dispatch(struct ps_session *s);
 
 static void lock_s(struct ps_session *s) { pthread_mutex_lock(&s->mu); }
 static void unlock_s(struct ps_session *s) { pthread_mutex_unlock(&s->mu); }
@@ -365,7 +367,7 @@ static void queue_act(struct ps_session *s, const struct action *a)
         return;
     }
     s->acts[s->nacts++] = *a;
-    if (a->type != ACT_POKE)
+    if (a->type == ACT_POKE)
         s->poke_pending = 1;
 }
 
@@ -705,10 +707,11 @@ static void *worker_main(void *arg)
         int ok = execute_job(job);
         lock_s(s);
         finish_job_locked(s, job, ok);
+        if (s->state != PS_STATE_FAILED)
+            apply_all_locked(s);
         free_job(job);
         unlock_s(s);
-        if (s->io.poke)
-            s->io.poke(s->io.ctx);
+        dispatch(s);
     }
     return NULL;
 }
@@ -837,7 +840,6 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     }
     sf->send_seq++;
     submit_job_locked(s, job);
-    queue_poke(s);
     return 0;
 }
 
@@ -935,7 +937,13 @@ static void maybe_window_locked(struct ps_session *s)
     if (want <= s->advertised)
         return;
     uint64_t credit = s->advertised - s->reassembly.deliver;
-    if (want - s->advertised < s->frame_size && credit > s->frame_size)
+    uint64_t delta = want - s->advertised;
+    uint64_t step = s->recv_window / 4;
+    if (step > 16ull * 1024 * 1024)
+        step = 16ull * 1024 * 1024;
+    if (step < s->frame_size)
+        step = s->frame_size;
+    if (delta < step && credit > s->recv_window / 2)
         return;
     uint8_t body[8];
     ps_put_u64(body, want);
@@ -2577,7 +2585,7 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
             break;
         }
         if (n == 0) {
-            if (sf->end_recv || sf->state == SF_RETIRED || session->closing)
+            if (sf->end_recv || sf->state == SF_RETIRED || session->closing || session->got_eos)
                 sf->close_pending = 1;
             else
                 fail_locked(session, PS_ERR_IO);

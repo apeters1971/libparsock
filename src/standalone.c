@@ -83,12 +83,32 @@ static void rt_poke(void *ctx)
     }
 }
 
+static void rt_poke_lane(struct ps_runtime *rt, int lane_idx)
+{
+    if (!rt || !rt->lanes || lane_idx < 0 || lane_idx >= rt->nlanes)
+        return;
+    if (rt->lanes[lane_idx].wake_w < 0)
+        return;
+    char byte = 1;
+    ssize_t n = write(rt->lanes[lane_idx].wake_w, &byte, 1);
+    (void)n;
+}
+
 static void rt_want(void *ctx, int fd, int want_read, int want_write)
 {
-    (void)fd;
     (void)want_read;
     (void)want_write;
-    rt_poke(ctx);
+    struct ps_runtime *rt = (struct ps_runtime *)ctx;
+    if (!rt || rt->nlanes <= 0)
+        return;
+    if (fd < 0 || rt->nlanes == 1) {
+        rt_poke(ctx);
+        return;
+    }
+    int m = fd % rt->nlanes;
+    if (m < 0)
+        m += rt->nlanes;
+    rt_poke_lane(rt, m);
 }
 
 static void listener_add(struct ps_listener *ln, const uint8_t id[32], ps_session_t *session)
@@ -202,15 +222,17 @@ static void *runtime_main(void *arg)
            steals the cores the checksum workers need. */
         if (lane->index == 0)
             ps_embed_service(rt->session);
-        /* One checksum per pass so the other lanes can take the rest.
-           Worker threads leave this queue empty and the lane blocks in poll. */
-        ps_session_progress_step(rt->session);
+        if (ps_session_inline_pending(rt->session)) {
+            ps_session_progress_step(rt->session);
+            if (rt->stop)
+                break;
+            if (ps_session_inline_pending(rt->session))
+                continue;
+        }
         if (rt->stop)
             break;
         if (read_again)
             lane_fill(lane, &read_again);
-        if (ps_session_inline_pending(rt->session))
-            continue;
         struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
         int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
         struct pollfd pfds[PS_MAX_SUBFLOWS + 3];
@@ -801,7 +823,10 @@ int ps_close(ps_connection_t *conn)
     if (!conn)
         return 0;
     ps_session_shutdown_write(conn->session);
-    ps_session_wait_flush(conn->session, 300);
+    uint32_t wait = conn->io_timeout_ms ? conn->io_timeout_ms : 5000;
+    if (wait > 10000)
+        wait = 10000;
+    ps_session_wait_flush(conn->session, wait);
     stop_runtime(conn->rt);
     ps_embed_close(conn->session);
     free(conn->rt);
