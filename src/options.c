@@ -20,8 +20,8 @@ void ps_options_init(struct ps_options *opt)
     opt->min_protection = PS_PROTECTION_CONFIDENTIAL;
     opt->connect_timeout_ms = 10000;
     opt->io_timeout_ms = 120000;
-    opt->max_poller_bytes = 1ull << 20;
-    opt->max_poller_records = 16;
+    opt->max_poller_bytes = 2ull << 20;
+    opt->max_poller_records = 32;
 }
 
 const char *ps_strerror(int err)

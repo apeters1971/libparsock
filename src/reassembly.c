@@ -6,6 +6,7 @@
 struct spt_seg {
     uint64_t off;
     size_t len;
+    size_t skip;
     uint8_t *data;
     struct spt_seg *next;
 };
@@ -64,7 +65,7 @@ int spt_reassembly_insert(struct spt_reassembly *r, uint64_t off,
         if (cur && cur->off <= off) {
             uint64_t end = cur->off + cur->len;
             size_t overlap = (size_t)((end - off) > len ? len : (end - off));
-            if (memcmp(cur->data + (size_t)(off - cur->off), data, overlap) != 0)
+            if (memcmp(cur->data + cur->skip + (size_t)(off - cur->off), data, overlap) != 0)
                 return -1;
             off += overlap;
             data += overlap;
@@ -98,6 +99,49 @@ int spt_reassembly_insert(struct spt_reassembly *r, uint64_t off,
     return 0;
 }
 
+int spt_reassembly_adopt(struct spt_reassembly *r, uint64_t off, uint8_t *data, size_t len)
+{
+    if (!r || (len > 0 && !data)) {
+        free(data);
+        return -1;
+    }
+    if (len == 0 || off + (uint64_t)len < off) {
+        free(data);
+        return len == 0 ? 0 : -1;
+    }
+    if (off < r->deliver || off + (uint64_t)len > r->deliver + (uint64_t)r->limit) {
+        int rc = spt_reassembly_insert(r, off, data, len);
+        free(data);
+        return rc;
+    }
+    struct spt_seg *prev = NULL;
+    struct spt_seg *cur = r->head;
+    while (cur && cur->off + cur->len <= off) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if ((cur && cur->off < off + (uint64_t)len) || (prev && prev->off + prev->len > off)) {
+        int rc = spt_reassembly_insert(r, off, data, len);
+        free(data);
+        return rc;
+    }
+    struct spt_seg *seg = (struct spt_seg *)calloc(1, sizeof(*seg));
+    if (!seg) {
+        free(data);
+        return -3;
+    }
+    seg->data = data;
+    seg->off = off;
+    seg->len = len;
+    seg->next = cur;
+    if (prev)
+        prev->next = seg;
+    else
+        r->head = seg;
+    r->buffered += len;
+    return 0;
+}
+
 size_t spt_reassembly_available(const struct spt_reassembly *r)
 {
     if (!r || !r->head || r->head->off != r->deliver)
@@ -120,7 +164,7 @@ size_t spt_reassembly_consume(struct spt_reassembly *r, uint8_t *dst, size_t cap
         size_t n = r->head->len;
         if (n > cap - got)
             n = cap - got;
-        memcpy(dst + got, r->head->data, n);
+        memcpy(dst + got, r->head->data + r->head->skip, n);
         got += n;
         r->deliver += n;
         r->buffered -= n;
@@ -130,7 +174,7 @@ size_t spt_reassembly_consume(struct spt_reassembly *r, uint8_t *dst, size_t cap
             free(dead->data);
             free(dead);
         } else {
-            memmove(r->head->data, r->head->data + n, r->head->len - n);
+            r->head->skip += n;
             r->head->off += n;
             r->head->len -= n;
         }

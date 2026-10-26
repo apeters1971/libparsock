@@ -16,6 +16,8 @@ void spt_reassembly_free(struct spt_reassembly *r);
 /* 0 ok, -1 conflict, -2 outside the receive window, -3 out of memory. */
 int spt_reassembly_insert(struct spt_reassembly *r, uint64_t off,
                           const uint8_t *data, size_t len);
+/* Takes ownership of data on every return, including errors. */
+int spt_reassembly_adopt(struct spt_reassembly *r, uint64_t off, uint8_t *data, size_t len);
 size_t spt_reassembly_available(const struct spt_reassembly *r);
 size_t spt_reassembly_consume(struct spt_reassembly *r, uint8_t *dst, size_t cap);
 

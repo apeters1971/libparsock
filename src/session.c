@@ -23,9 +23,10 @@
 #include <openssl/rand.h>
 
 #define ACT_MAX 48
-#define RX_PIPELINE 4
+#define RX_PIPELINE 32
 /* One context per in-flight record. A context is not shared across workers. */
-#define SF_AEAD_SLOTS 4
+#define SF_AEAD_SLOTS 16
+#define RX_BYTES (2u * 1024u * 1024u)
 
 enum {
     ACT_IO = 1,
@@ -101,6 +102,7 @@ struct crypto_job {
     EVP_CIPHER_CTX *aead_ctx;
     int aead_owned;
     int aead_slot;
+    int keep_in;
 };
 
 struct gen_mat {
@@ -149,6 +151,7 @@ struct subflow {
     size_t preface_len;
     size_t preface_off;
     uint8_t *rx;
+    size_t rx_off;
     size_t rx_len;
     size_t rx_cap;
     struct plain_slot *in_head;
@@ -156,8 +159,8 @@ struct subflow {
     unsigned in_flight;
     EVP_CIPHER_CTX *seal_ctx[SF_AEAD_SLOTS];
     EVP_CIPHER_CTX *open_ctx[SF_AEAD_SLOTS];
-    uint8_t seal_busy;
-    uint8_t open_busy;
+    uint32_t seal_busy;
+    uint32_t open_busy;
 };
 
 struct ps_session {
@@ -177,6 +180,7 @@ struct ps_session {
     int eos_pending;
     int got_eos;
     int in_user_read;
+    int rx_hold;
     int send_stalled;
     int need_export;
     int root_valid;
@@ -524,6 +528,8 @@ static int sf_alloc_rx(struct ps_session *s, struct subflow *sf)
     if (sf->rx)
         return 0;
     sf->rx_cap = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (sf->rx_cap < RX_BYTES)
+        sf->rx_cap = RX_BYTES;
     sf->rx = (uint8_t *)malloc(sf->rx_cap);
     if (!sf->rx)
         return -1;
@@ -549,16 +555,16 @@ static void refresh_write_locked(struct ps_session *s, struct subflow *sf)
 static EVP_CIPHER_CTX *sf_take_aead(struct subflow *sf, int open, int *slot, int *owned)
 {
     EVP_CIPHER_CTX **pool = open ? sf->open_ctx : sf->seal_ctx;
-    uint8_t *busy = open ? &sf->open_busy : &sf->seal_busy;
+    uint32_t *busy = open ? &sf->open_busy : &sf->seal_busy;
     for (int i = 0; i < SF_AEAD_SLOTS; i++) {
-        if (*busy & (uint8_t)(1u << i))
+        if (*busy & (uint32_t)(1u << i))
             continue;
         if (!pool[i]) {
             pool[i] = spt_aead_ctx_new();
             if (!pool[i])
                 return NULL;
         }
-        *busy = (uint8_t)(*busy | (uint8_t)(1u << i));
+        *busy |= (uint32_t)(1u << i);
         *slot = i;
         *owned = 0;
         return pool[i];
@@ -576,8 +582,8 @@ static void release_aead(struct crypto_job *job)
     if (job->aead_owned) {
         spt_aead_ctx_free(job->aead_ctx);
     } else if (job->sf && job->aead_slot >= 0 && job->aead_slot < SF_AEAD_SLOTS) {
-        uint8_t *busy = job->op_open ? &job->sf->open_busy : &job->sf->seal_busy;
-        *busy = (uint8_t)(*busy & (uint8_t)~(1u << job->aead_slot));
+        uint32_t *busy = job->op_open ? &job->sf->open_busy : &job->sf->seal_busy;
+        *busy &= ~(uint32_t)(1u << job->aead_slot);
     }
     job->aead_ctx = NULL;
 }
@@ -587,9 +593,10 @@ static void free_job(struct crypto_job *job)
     if (!job)
         return;
     release_aead(job);
-    if (job->in)
+    if (job->in && !job->keep_in) {
         OPENSSL_cleanse(job->in, job->in_len ? job->in_len : 1);
-    free(job->in);
+        free(job->in);
+    }
     OPENSSL_cleanse(job->key, sizeof(job->key));
     free(job);
 }
@@ -601,7 +608,7 @@ static int execute_job(struct crypto_job *job)
         if (job->op_open) {
             if (spt_mac_verify(job->key, job->aad, in, job->in_len, job->tag) != 0)
                 return -1;
-            if (job->in_len && job->out)
+            if (job->in_len && job->out && job->out != in)
                 memcpy(job->out, in, job->in_len);
             return 0;
         }
@@ -962,8 +969,9 @@ static void apply_slot_locked(struct ps_session *s, struct subflow *sf, struct p
             fail_locked(s, PS_ERR_FLOW);
             return;
         }
-        int ir = spt_reassembly_insert(&s->reassembly, h->logical_offset, slot->plain,
-                                       h->plaintext_length);
+        uint8_t *plain = slot->plain;
+        slot->plain = NULL;
+        int ir = spt_reassembly_adopt(&s->reassembly, h->logical_offset, plain, h->plaintext_length);
         if (ir == -2) {
             fail_locked(s, PS_ERR_FLOW);
             return;
@@ -1032,14 +1040,35 @@ static void apply_all_locked(struct ps_session *s)
     }
 }
 
+static uint8_t *rx_ptr(const struct subflow *sf)
+{
+    return sf->rx + sf->rx_off;
+}
+
+static size_t rx_live(const struct subflow *sf)
+{
+    return sf->rx_len - sf->rx_off;
+}
+
+static void rx_compact(struct subflow *sf)
+{
+    if (sf->rx_off == 0)
+        return;
+    size_t live = rx_live(sf);
+    if (live)
+        memmove(sf->rx, sf->rx + sf->rx_off, live);
+    sf->rx_len = live;
+    sf->rx_off = 0;
+}
+
 static int frame_ready(const struct subflow *sf)
 {
-    if (!sf->rx || sf->rx_len < SPT_FRAME_HEADER_LEN)
+    if (!sf->rx || rx_live(sf) < SPT_FRAME_HEADER_LEN)
         return 0;
     struct spt_header hdr;
-    if (spt_header_decode(sf->rx, &hdr) != 0)
+    if (spt_header_decode(rx_ptr(sf), &hdr) != 0)
         return 1;
-    return sf->rx_len >= spt_frame_wire_len(hdr.plaintext_length);
+    return rx_live(sf) >= spt_frame_wire_len(hdr.plaintext_length);
 }
 
 static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *budget)
@@ -1052,10 +1081,10 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
                 queue_io(s, sf->fd, 0, sf->want_write);
             break;
         }
-        if (sf->rx_len < SPT_FRAME_HEADER_LEN)
+        if (rx_live(sf) < SPT_FRAME_HEADER_LEN)
             break;
         struct spt_header hdr;
-        if (spt_header_decode(sf->rx, &hdr) != 0) {
+        if (spt_header_decode(rx_ptr(sf), &hdr) != 0) {
             fail_locked(s, PS_ERR_PROTO);
             break;
         }
@@ -1064,7 +1093,7 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
             break;
         }
         size_t need = spt_frame_wire_len(hdr.plaintext_length);
-        if (sf->rx_len < need)
+        if (rx_live(sf) < need)
             break;
         struct gen_mat *g = NULL;
         if (hdr.key_generation == sf->recv_gen) {
@@ -1091,26 +1120,27 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
         }
         struct plain_slot *slot = (struct plain_slot *)calloc(1, sizeof(*slot));
         struct crypto_job *job = (struct crypto_job *)calloc(1, sizeof(*job));
-        uint8_t *plain = (uint8_t *)malloc(hdr.plaintext_length ? hdr.plaintext_length : 1);
-        uint8_t *cipher = NULL;
-        if (hdr.plaintext_length)
-            cipher = (uint8_t *)malloc(hdr.plaintext_length);
-        if (!slot || !job || !plain || (hdr.plaintext_length && !cipher)) {
+        uint8_t *payload = (uint8_t *)malloc(hdr.plaintext_length ? hdr.plaintext_length : 1);
+        if (!slot || !job || !payload) {
             free(slot);
             free(job);
-            free(plain);
-            free(cipher);
+            free(payload);
             fail_locked(s, PS_ERR_NOMEM);
             break;
         }
         if (hdr.plaintext_length)
-            memcpy(cipher, sf->rx + SPT_FRAME_HEADER_LEN, hdr.plaintext_length);
-        memcpy(job->tag_store, sf->rx + SPT_FRAME_HEADER_LEN + hdr.plaintext_length, SPT_TAG_LEN);
-        memmove(sf->rx, sf->rx + need, sf->rx_len - need);
-        sf->rx_len -= need;
+            memcpy(payload, rx_ptr(sf) + SPT_FRAME_HEADER_LEN, hdr.plaintext_length);
+        memcpy(job->tag_store, rx_ptr(sf) + SPT_FRAME_HEADER_LEN + hdr.plaintext_length, SPT_TAG_LEN);
+        sf->rx_off += need;
+        if (sf->rx_off == sf->rx_len) {
+            sf->rx_off = 0;
+            sf->rx_len = 0;
+        } else if (sf->rx_off > sf->rx_cap / 2) {
+            rx_compact(sf);
+        }
         sf->parse_seq++;
         slot->hdr = hdr;
-        slot->plain = plain;
+        slot->plain = payload;
         slot->next = NULL;
         if (sf->in_tail)
             sf->in_tail->next = slot;
@@ -1128,11 +1158,11 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
             memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
         }
         job->seq = hdr.record_sequence;
-        memcpy(job->aad, sf->rx, 0); /* aad copied below from saved header bytes */
         spt_header_encode(job->aad, &hdr);
-        job->in = cipher;
+        job->in = hdr.plaintext_length ? payload : NULL;
         job->in_len = hdr.plaintext_length;
-        job->out = plain;
+        job->out = hdr.plaintext_length ? payload : NULL;
+        job->keep_in = 1;
         job->tag = job->tag_store;
         job->pslot = slot;
         job->sf = sf;
@@ -1982,6 +2012,10 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
 
 static void session_destroy(struct ps_session *s)
 {
+    lock_s(s);
+    while (s->rx_hold)
+        pthread_cond_wait(&s->cv, &s->mu);
+    unlock_s(s);
     ps_session_stop_workers(s);
     if (s->io.stop_io) {
         if (s->ctrl_fd >= 0)
@@ -2414,6 +2448,7 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
         unlock_s(session);
         return -err;
     }
+    session->rx_hold++;
     size_t got = 0;
     unsigned budget = session->max_poller_records ? session->max_poller_records : 1;
     while (got < session->max_poller_bytes && session->state != PS_STATE_FAILED) {
@@ -2430,6 +2465,9 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
         }
         if (frame_ready(sf) && budget == before && before == 0)
             break;
+        size_t one = spt_frame_wire_len((uint32_t)session->frame_size);
+        if (sf->rx_cap - sf->rx_len < one && sf->rx_off > 0)
+            rx_compact(sf);
         size_t space = sf->rx_cap - sf->rx_len;
         if (space == 0) {
             if (frame_ready(sf)) {
@@ -2445,11 +2483,22 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
                 *again = 1;
             break;
         }
-        ssize_t n = recv(fd, sf->rx + sf->rx_len, space, 0);
+        uint8_t *dst = sf->rx + sf->rx_len;
+        unlock_s(session);
+        ssize_t n = recv(fd, dst, space, 0);
+        int errn = errno;
+        lock_s(session);
+        sf = sf_by_fd(session, fd);
+        if (!sf || sf->connecting || sf->state == SF_RETIRED) {
+            if (n > 0) {
+                fail_locked(session, PS_ERR_IO);
+            }
+            break;
+        }
         if (n < 0) {
-            if (errno == EINTR)
+            if (errn == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errn == EAGAIN || errn == EWOULDBLOCK)
                 break;
             fail_locked(session, PS_ERR_IO);
             break;
@@ -2464,6 +2513,9 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
         sf->rx_len += (size_t)n;
         got += (size_t)n;
     }
+    if (session->rx_hold)
+        session->rx_hold--;
+    pthread_cond_broadcast(&session->cv);
     int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
     unlock_s(session);
     return err ? -err : PS_OK;
