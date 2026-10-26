@@ -54,6 +54,12 @@ enum class protection : int {
     authenticated = PS_PROTECTION_AUTHENTICATED
 };
 
+enum class transport : int {
+    automatic = PS_TRANSPORT_AUTO,
+    tcp = PS_TRANSPORT_TCP,
+    rdma = PS_TRANSPORT_RDMA_RC
+};
+
 enum class errc : int {
     ok = PS_OK,
     invalid = PS_ERR_INVAL,
@@ -149,7 +155,7 @@ public:
 
     options(const options &other)
         : opt_(other.opt_), tls_(other.tls_), cert_(other.cert_), key_(other.key_), ca_(other.ca_),
-          name_(other.name_)
+          name_(other.name_), rdma_dev_(other.rdma_dev_)
     {
         bind();
     }
@@ -163,6 +169,7 @@ public:
             key_ = other.key_;
             ca_ = other.ca_;
             name_ = other.name_;
+            rdma_dev_ = other.rdma_dev_;
             bind();
         }
         return *this;
@@ -170,7 +177,8 @@ public:
 
     options(options &&other) noexcept
         : opt_(other.opt_), tls_(other.tls_), cert_(std::move(other.cert_)),
-          key_(std::move(other.key_)), ca_(std::move(other.ca_)), name_(std::move(other.name_))
+          key_(std::move(other.key_)), ca_(std::move(other.ca_)), name_(std::move(other.name_)),
+          rdma_dev_(std::move(other.rdma_dev_))
     {
         bind();
         other.bind();
@@ -185,6 +193,7 @@ public:
             key_ = std::move(other.key_);
             ca_ = std::move(other.ca_);
             name_ = std::move(other.name_);
+            rdma_dev_ = std::move(other.rdma_dev_);
             bind();
             other.bind();
         }
@@ -261,6 +270,32 @@ public:
         opt_.max_poller_records = records;
         return *this;
     }
+    options &transport(transport preference)
+    {
+        opt_.transport = static_cast<ps_transport_t>(preference);
+        if (preference == transport::rdma)
+            opt_.allow_tcp_fallback = 0;
+        if (preference == transport::automatic)
+            opt_.allow_tcp_fallback = 1;
+        return *this;
+    }
+    options &tcp_fallback(bool enabled)
+    {
+        opt_.allow_tcp_fallback = enabled ? 1 : 0;
+        return *this;
+    }
+    options &rdma_device(std::string name)
+    {
+        rdma_dev_ = std::move(name);
+        bind();
+        return *this;
+    }
+    options &rdma_depths(unsigned send_depth, unsigned recv_depth)
+    {
+        opt_.rdma_send_depth = send_depth;
+        opt_.rdma_recv_depth = recv_depth;
+        return *this;
+    }
     options &certificate(std::string path)
     {
         cert_ = std::move(path);
@@ -306,6 +341,7 @@ private:
         tls_.ca_file = ca_.empty() ? nullptr : ca_.c_str();
         tls_.server_name = name_.empty() ? nullptr : name_.c_str();
         opt_.tls = &tls_;
+        opt_.rdma_device = rdma_dev_.empty() ? nullptr : rdma_dev_.c_str();
     }
 
     ps_options opt_{};
@@ -314,6 +350,7 @@ private:
     std::string key_;
     std::string ca_;
     std::string name_;
+    std::string rdma_dev_;
 };
 
 namespace detail {
@@ -508,6 +545,16 @@ public:
         if (!conn_)
             return errc::invalid;
         return static_cast<errc>(ps_connection_error(conn_));
+    }
+
+    parsock::transport transport() const
+    {
+        if (!conn_)
+            return parsock::transport::tcp;
+        int selected = ps_connection_transport(conn_);
+        if (selected == PS_TRANSPORT_RDMA_RC)
+            return parsock::transport::rdma;
+        return parsock::transport::tcp;
     }
 
     stats statistics() const

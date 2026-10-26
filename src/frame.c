@@ -259,3 +259,83 @@ int spt_join_decode(const uint8_t in[SPT_JOIN_PLAIN_LEN], struct spt_join_plain 
     memcpy(msg->hello_hash, in + 108, SPT_HASH_LEN);
     return 0;
 }
+
+int spt_transport_offer_encode(uint8_t out[SPT_TRANSPORT_OFFER_LEN],
+                               const struct spt_transport_offer *msg)
+{
+    if (!out || !msg)
+        return -1;
+    memset(out, 0, SPT_TRANSPORT_OFFER_LEN);
+    out[0] = msg->preference;
+    out[1] = msg->fallback ? 1 : 0;
+    ps_put_u32(out + 4, msg->initial_lanes);
+    ps_put_u32(out + 8, msg->max_lanes);
+    ps_put_u32(out + 12, msg->send_depth);
+    ps_put_u32(out + 16, msg->recv_depth);
+    ps_put_u32(out + 20, msg->max_message);
+    return 0;
+}
+
+int spt_transport_offer_decode(const uint8_t in[SPT_TRANSPORT_OFFER_LEN],
+                               struct spt_transport_offer *msg)
+{
+    if (!in || !msg)
+        return -1;
+    if (ps_get_u16(in + 2) != 0)
+        return -1;
+    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC)
+        return -1;
+    memset(msg, 0, sizeof(*msg));
+    msg->preference = in[0];
+    msg->fallback = in[1] ? 1 : 0;
+    if (in[1] != 0 && in[1] != 1)
+        return -1;
+    msg->initial_lanes = ps_get_u32(in + 4);
+    msg->max_lanes = ps_get_u32(in + 8);
+    msg->send_depth = ps_get_u32(in + 12);
+    msg->recv_depth = ps_get_u32(in + 16);
+    msg->max_message = ps_get_u32(in + 20);
+    if (msg->initial_lanes < 1 || msg->max_lanes < msg->initial_lanes)
+        return -1;
+    if (msg->max_message < SPT_FRAME_HEADER_LEN + SPT_TAG_LEN || msg->max_message > SPT_MAX_FRAME)
+        return -1;
+    return 0;
+}
+
+int spt_transport_select_encode(uint8_t out[SPT_TRANSPORT_SELECT_LEN],
+                                const struct spt_transport_select *msg)
+{
+    if (!out || !msg)
+        return -1;
+    memset(out, 0, SPT_TRANSPORT_SELECT_LEN);
+    out[0] = msg->transport;
+    ps_put_u16(out + 2, msg->rdma_port);
+    ps_put_u32(out + 4, msg->lanes);
+    ps_put_u32(out + 8, msg->send_depth);
+    ps_put_u32(out + 12, msg->recv_depth);
+    return 0;
+}
+
+int spt_transport_select_decode(const uint8_t in[SPT_TRANSPORT_SELECT_LEN],
+                                struct spt_transport_select *msg)
+{
+    if (!in || !msg)
+        return -1;
+    if (in[1] != 0)
+        return -1;
+    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC)
+        return -1;
+    memset(msg, 0, sizeof(*msg));
+    msg->transport = in[0];
+    msg->rdma_port = ps_get_u16(in + 2);
+    msg->lanes = ps_get_u32(in + 4);
+    msg->send_depth = ps_get_u32(in + 8);
+    msg->recv_depth = ps_get_u32(in + 12);
+    if (msg->lanes < 1 || msg->lanes > 64)
+        return -1;
+    if (msg->transport == SPT_TRANSPORT_RDMA_RC &&
+        (msg->lanes > 16 || msg->rdma_port == 0 || msg->send_depth < 2 || msg->recv_depth < 4 ||
+         msg->send_depth > 256 || msg->recv_depth > 256))
+        return -1;
+    return 0;
+}

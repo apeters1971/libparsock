@@ -142,6 +142,59 @@ int main(void)
                memcmp(join2.hello_hash, join.hello_hash, 32) == 0,
            "join fields");
 
+    struct spt_transport_offer offer;
+    memset(&offer, 0, sizeof(offer));
+    offer.preference = SPT_TRANSPORT_RDMA_RC;
+    offer.fallback = 1;
+    offer.initial_lanes = 2;
+    offer.max_lanes = 8;
+    offer.send_depth = 16;
+    offer.recv_depth = 64;
+    offer.max_message = SPT_FRAME_HEADER_LEN + 65536 + SPT_TAG_LEN;
+    uint8_t ob[SPT_TRANSPORT_OFFER_LEN];
+    expect(spt_transport_offer_encode(ob, &offer) == 0, "offer encode");
+    struct spt_transport_offer offer2;
+    expect(spt_transport_offer_decode(ob, &offer2) == 0, "offer decode");
+    expect(offer2.preference == SPT_TRANSPORT_RDMA_RC && offer2.fallback == 1 &&
+               offer2.initial_lanes == 2 && offer2.max_lanes == 8 && offer2.recv_depth == 64,
+           "offer fields");
+    ob[2] = 1;
+    expect(spt_transport_offer_decode(ob, &offer2) != 0, "offer reserved");
+    ob[2] = 0;
+    ob[0] = 9;
+    expect(spt_transport_offer_decode(ob, &offer2) != 0, "offer type");
+
+    struct spt_transport_select sel;
+    memset(&sel, 0, sizeof(sel));
+    sel.transport = SPT_TRANSPORT_RDMA_RC;
+    sel.rdma_port = 4791;
+    sel.lanes = 2;
+    sel.send_depth = 16;
+    sel.recv_depth = 64;
+    uint8_t sb[SPT_TRANSPORT_SELECT_LEN];
+    expect(spt_transport_select_encode(sb, &sel) == 0, "select encode");
+    struct spt_transport_select sel2;
+    expect(spt_transport_select_decode(sb, &sel2) == 0, "select decode");
+    expect(sel2.transport == SPT_TRANSPORT_RDMA_RC && sel2.rdma_port == 4791 && sel2.lanes == 2 &&
+               sel2.send_depth == 16,
+           "select fields");
+    sb[0] = SPT_TRANSPORT_TCP;
+    sb[2] = 0;
+    sb[3] = 0;
+    expect(spt_transport_select_decode(sb, &sel2) == 0, "tcp select");
+    expect(sel2.transport == SPT_TRANSPORT_TCP && sel2.lanes == 2, "tcp select lanes");
+
+    uint8_t root[32], cnonce[32], snonce[32], session_bytes[32], token_a[32], token_b[32];
+    memset(root, 7, sizeof(root));
+    memset(cnonce, 1, sizeof(cnonce));
+    memset(snonce, 2, sizeof(snonce));
+    memset(session_bytes, 3, sizeof(session_bytes));
+    expect(spt_rdma_token(root, 4, cnonce, snonce, session_bytes, token_a) == 0, "token");
+    expect(spt_rdma_token(root, 4, cnonce, snonce, session_bytes, token_b) == 0, "token again");
+    expect(memcmp(token_a, token_b, 32) == 0, "token stable");
+    expect(spt_rdma_token(root, 5, cnonce, snonce, session_bytes, token_b) == 0, "token other lane");
+    expect(memcmp(token_a, token_b, 32) != 0, "token lane bound");
+
     if (fails) {
         fprintf(stderr, "%d frame checks failed\n", fails);
         return 1;

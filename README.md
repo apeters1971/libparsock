@@ -4,7 +4,7 @@ Userspace proof of concept for **Secure Parallel Transport (SPT/0.1)**.
 
 One reliable, ordered, bidirectional byte stream is carried on several ordinary TCP sockets. A TLS 1.3 control connection authenticates the peers and stays up for the session. Data sockets carry custom AEAD records, not TLS records. The protocol core does not own the event loop: the same session runs under a library poll thread or under an external poller.
 
-This tree is a research implementation. It is not a production transport, it does not modify the kernel or OpenSSL, and it has not had a security review. The wire format is experimental and is written down in [docs/spt-0.1.md](docs/spt-0.1.md).
+This tree is a research implementation. It is not a production transport, it does not modify the kernel or OpenSSL, and it has not had a security review. The wire format is experimental and is written down in [docs/spt-0.1.md](docs/spt-0.1.md). An optional RDMA RC SEND/RECV data plane is described in [docs/spt-rdma.md](docs/spt-rdma.md) and is built when librdmacm and libibverbs are present. The default transport is TCP.
 
 ## Build
 
@@ -39,6 +39,7 @@ ctest --test-dir build-asan --output-on-failure
 - A header-only C++17 wrapper in `include/parsock.hpp` (`parsock::options`, `connection`, `listener`, `session`)
 - An embedded readiness API (`ps_on_readable`, `ps_on_writable`, `ps_embed_service`) for an external poller
 - Optional crypto worker threads, independent of the socket count
+- Optional RDMA Reliable Connected SEND/RECV data plane on Linux (`ps_options.transport`)
 
 Out of scope for this tree: a kernel client, `sptd`, native XRootD integration, cross-socket retransmission, and io_uring.
 
@@ -90,6 +91,8 @@ A terminal shows transmit and receive rate, with a sparkline of about the last m
 - `include/parsock.h` — C application API
 - `include/parsock.hpp` — header-only C++17 wrapper
 - `include/spt_wire.h` — experimental wire codec and key schedule
+- `docs/spt-0.1.md` — experimental TCP wire specification
+- `docs/spt-rdma.md` — proposed RDMA transport extension
 - `src/session.c` — protocol core
 - `src/drive.c` — TLS pump and readiness entry points
 - `src/standalone.c` — poll thread, listener, and blocking API

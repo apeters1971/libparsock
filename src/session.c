@@ -7,6 +7,7 @@
 #include "endian.h"
 #include "log.h"
 #include "net.h"
+#include "rdma.h"
 #include "reassembly.h"
 #include "spt_wire.h"
 #include "tls.h"
@@ -31,6 +32,7 @@
 #define SF_AEAD_SLOTS 64
 #define RX_BYTES (4u * 1024u * 1024u)
 #define FLUSH_IOV 16
+#define RDMA_HOLD_MAX 32
 
 enum {
     ACT_IO = 1,
@@ -46,6 +48,7 @@ enum {
     SF_UNUSED = 0,
     SF_OPEN_SENT,
     SF_WAIT_TCP,
+    SF_WAIT_RDMA,
     SF_JOINING,
     SF_ACTIVE,
     SF_DRAINING,
@@ -142,6 +145,15 @@ struct subflow {
     int server_nonce_set;
     int want_read;
     int want_write;
+    int rdma;
+    int need_rdma;
+    int rdma_started;
+    int rdma_up;
+    int rdma_auth;
+    uint32_t rdma_credit;
+    uint32_t rdma_sent;
+    uint32_t rdma_recv_posted;
+    uint32_t rdma_credit_sent;
     int read_paused;
     int rekey_wait;
     int local_announced;
@@ -173,6 +185,14 @@ struct subflow {
     EVP_CIPHER_CTX *open_ctx[SF_AEAD_SLOTS];
     uint64_t seal_busy;
     uint64_t open_busy;
+};
+
+struct rdma_hold {
+    int used;
+    uint32_t lane;
+    unsigned slot;
+    const uint8_t *data;
+    size_t len;
 };
 
 struct ps_session {
@@ -283,6 +303,20 @@ struct ps_session {
     uint64_t records_tx;
     uint64_t records_rx;
     struct ps_hwinfo hw;
+    ps_transport_t transport_pref;
+    int allow_tcp_fallback;
+    int offer_sent;
+    int transport_ready;
+    uint8_t transport;
+    unsigned rdma_send_depth;
+    unsigned rdma_recv_depth;
+    unsigned rdma_cq_budget;
+    char *rdma_device;
+    uint16_t rdma_port;
+    struct ps_rdma *rdma;
+    int rdma_serving;
+    int rdma_nhold;
+    struct rdma_hold rdma_hold[RDMA_HOLD_MAX];
 };
 
 static void fail_locked(struct ps_session *s, int err);
@@ -567,6 +601,11 @@ static void refresh_write_locked(struct ps_session *s, struct subflow *sf)
         ready = 1;
     int changed = sf->want_write != ready;
     sf->want_write = ready;
+    if (sf->rdma) {
+        if (changed && ready)
+            queue_poke(s);
+        return;
+    }
     if (sf->fd >= 0 && changed)
         queue_io(s, sf->fd, sf->want_read, sf->want_write);
 }
@@ -712,10 +751,13 @@ static void finish_job_locked(struct ps_session *s, struct crypto_job *job, int 
         if (ok != 0)
             fail_locked(s, PS_ERR_CRYPTO);
         if (job->sf && job->sf->read_paused && job->sf->in_flight <= RX_PIPELINE / 2 &&
-            job->sf->fd >= 0 && job->sf->state != SF_RETIRED) {
+            job->sf->state != SF_RETIRED && (job->sf->fd >= 0 || job->sf->rdma)) {
             job->sf->read_paused = 0;
             job->sf->want_read = 1;
-            queue_io(s, job->sf->fd, 1, job->sf->want_write);
+            if (job->sf->fd >= 0)
+                queue_io(s, job->sf->fd, 1, job->sf->want_write);
+            else
+                queue_poke(s);
         }
     } else if (job->wslot) {
         job->wslot->ready = 1;
@@ -1427,6 +1469,9 @@ static void open_one_locked(struct ps_session *s)
     sf->used = 1;
     sf->id = id;
     sf->state = SF_OPEN_SENT;
+    sf->rdma = s->transport == SPT_TRANSPORT_RDMA_RC ? 1 : 0;
+    if (sf->rdma)
+        sf->rdma_credit = s->rdma_recv_depth;
     if (RAND_bytes(sf->client_nonce, SPT_NONCE_LEN) != 1) {
         fail_locked(s, PS_ERR_CRYPTO);
         return;
@@ -1500,6 +1545,219 @@ static void become_negotiated_export(struct ps_session *s)
 {
     hash_hellos(s);
     s->need_export = 1;
+}
+
+static unsigned clamp_rdma_depth(uint32_t peer, unsigned local, unsigned floor)
+{
+    unsigned d = peer ? (unsigned)peer : local;
+    if (local && d > local)
+        d = local;
+    if (d < floor)
+        d = floor;
+    if (d > 256)
+        d = 256;
+    return d;
+}
+
+static int lane_token_locked(struct ps_session *s, struct subflow *sf, uint8_t out[SPT_RDMA_TOKEN_LEN])
+{
+    if (!s->root_valid || !sf->server_nonce_set)
+        return -1;
+    return spt_rdma_token(s->root, sf->id, sf->client_nonce, sf->server_nonce, s->session_id, out);
+}
+
+static int authorize_lane_locked(struct ps_session *s, struct subflow *sf)
+{
+    if (!sf->rdma || sf->rdma_auth || !s->rdma)
+        return 0;
+    if (!s->root_valid || !sf->server_nonce_set)
+        return 0;
+    uint8_t token[SPT_RDMA_TOKEN_LEN];
+    if (lane_token_locked(s, sf, token) != 0)
+        return -1;
+    int rc = ps_rdma_authorize(s->rdma, sf->id, token);
+    OPENSSL_cleanse(token, sizeof(token));
+    if (rc != 0)
+        return -1;
+    sf->rdma_auth = 1;
+    return 0;
+}
+
+static void select_tcp_locked(struct ps_session *s)
+{
+    s->transport = SPT_TRANSPORT_TCP;
+    s->transport_ready = 1;
+    ps_log("transport tcp");
+}
+
+static int select_rdma_locked(struct ps_session *s, uint32_t lanes, unsigned send_depth,
+                              unsigned recv_depth, uint16_t peer_port)
+{
+    if (lanes < 1 || lanes > 16 || s->rdma)
+        return -1;
+    struct ps_rdma_cfg cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.is_server = s->is_server;
+    cfg.device = s->rdma_device;
+    cfg.send_depth = send_depth;
+    cfg.recv_depth = recv_depth;
+    cfg.max_lanes = (unsigned)lanes;
+    cfg.message_bytes = spt_frame_wire_len((uint32_t)s->frame_size);
+    uint16_t bound = 0;
+    struct ps_rdma *engine = ps_rdma_open(&cfg, s->is_server ? &bound : NULL);
+    if (!engine)
+        return -1;
+    if (s->is_server && bound == 0) {
+        ps_rdma_close(engine);
+        return -1;
+    }
+    s->rdma = engine;
+    s->rdma_port = s->is_server ? bound : peer_port;
+    s->rdma_send_depth = send_depth;
+    s->rdma_recv_depth = recv_depth;
+    s->transport = SPT_TRANSPORT_RDMA_RC;
+    s->transport_ready = 1;
+    s->expect = lanes;
+    s->max_sockets = lanes;
+    if (s->min_sockets > lanes)
+        s->min_sockets = lanes;
+    s->scale_mode = PS_SCALE_FIXED;
+    ps_log("transport rdma lanes=%u port=%u", lanes, s->rdma_port);
+    queue_poke(s);
+    return 0;
+}
+
+static void send_transport_offer_locked(struct ps_session *s)
+{
+    if (s->offer_sent || s->is_server || s->state == PS_STATE_FAILED)
+        return;
+    struct spt_transport_offer msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.preference = SPT_TRANSPORT_RDMA_RC;
+    msg.fallback = s->allow_tcp_fallback ? 1 : 0;
+    msg.initial_lanes = s->expect ? s->expect : 1;
+    msg.max_lanes = s->max_sockets >= msg.initial_lanes ? s->max_sockets : msg.initial_lanes;
+    msg.send_depth = s->rdma_send_depth;
+    msg.recv_depth = s->rdma_recv_depth;
+    msg.max_message = (uint32_t)spt_frame_wire_len((uint32_t)s->frame_size);
+    uint8_t body[SPT_TRANSPORT_OFFER_LEN];
+    if (spt_transport_offer_encode(body, &msg) != 0) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    if (queue_ctrl_locked(s, SPT_CTRL_TRANSPORT_OFFER, body, sizeof(body)) != 0)
+        return;
+    s->offer_sent = 1;
+    ps_log("rdma offer lanes=%u fallback=%u", msg.initial_lanes, msg.fallback);
+}
+
+static void queue_transport_select_locked(struct ps_session *s)
+{
+    struct spt_transport_select sel;
+    memset(&sel, 0, sizeof(sel));
+    sel.transport = s->transport;
+    sel.rdma_port = s->transport == SPT_TRANSPORT_RDMA_RC ? s->rdma_port : 0;
+    sel.lanes = s->expect ? s->expect : 1;
+    sel.send_depth = s->rdma_send_depth;
+    sel.recv_depth = s->rdma_recv_depth;
+    uint8_t body[SPT_TRANSPORT_SELECT_LEN];
+    if (spt_transport_select_encode(body, &sel) != 0) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    queue_ctrl_locked(s, SPT_CTRL_TRANSPORT_SELECT, body, sizeof(body));
+}
+
+static void handle_transport_offer_locked(struct ps_session *s, const uint8_t *body, size_t len)
+{
+    if (!s->is_server || s->transport_ready || len != SPT_TRANSPORT_OFFER_LEN) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    struct spt_transport_offer msg;
+    if (spt_transport_offer_decode(body, &msg) != 0) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    size_t wire = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (msg.max_message < wire) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    int want_rdma = msg.preference == SPT_TRANSPORT_RDMA_RC;
+    int fallback = msg.fallback || s->allow_tcp_fallback;
+    int opened = 0;
+    if (want_rdma && s->transport_pref != PS_TRANSPORT_TCP && ps_rdma_available()) {
+        unsigned send_d = clamp_rdma_depth(msg.send_depth, s->rdma_send_depth, 2);
+        unsigned recv_d = clamp_rdma_depth(msg.recv_depth, s->rdma_recv_depth, 4);
+        uint32_t lanes = msg.initial_lanes;
+        if (s->expect && lanes > s->expect)
+            lanes = s->expect;
+        if (msg.max_lanes && lanes > msg.max_lanes)
+            lanes = msg.max_lanes;
+        if (lanes > 16)
+            lanes = 16;
+        if (lanes >= 1 && select_rdma_locked(s, lanes, send_d, recv_d, 0) == 0)
+            opened = 1;
+    }
+    if (!opened) {
+        if (!want_rdma || fallback) {
+            select_tcp_locked(s);
+        } else {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+    }
+    queue_transport_select_locked(s);
+}
+
+static void handle_transport_select_locked(struct ps_session *s, const uint8_t *body, size_t len)
+{
+    if (s->is_server || s->transport_ready || !s->offer_sent || len != SPT_TRANSPORT_SELECT_LEN) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    struct spt_transport_select sel;
+    if (spt_transport_select_decode(body, &sel) != 0) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    if (sel.transport == SPT_TRANSPORT_TCP) {
+        if (s->transport_pref == PS_TRANSPORT_RDMA_RC && !s->allow_tcp_fallback) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+        select_tcp_locked(s);
+        for (unsigned i = 0; i < s->expect; i++)
+            open_one_locked(s);
+        return;
+    }
+    if (sel.send_depth > 256 || sel.recv_depth > 256 ||
+        select_rdma_locked(s, sel.lanes, sel.send_depth, sel.recv_depth, sel.rdma_port) != 0) {
+        fail_locked(s, PS_ERR_IO);
+        return;
+    }
+    for (unsigned i = 0; i < s->expect; i++)
+        open_one_locked(s);
+}
+
+static void handle_rdma_credit_locked(struct ps_session *s, const uint8_t *body, size_t len)
+{
+    if (len != SPT_RDMA_CREDIT_LEN || s->transport != SPT_TRANSPORT_RDMA_RC) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    struct subflow *sf = sf_by_id(s, ps_get_u32(body));
+    uint32_t credit = ps_get_u32(body + 4);
+    if (!sf || !sf->rdma || credit < sf->rdma_credit) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    if (credit > sf->rdma_credit) {
+        sf->rdma_credit = credit;
+        pthread_cond_broadcast(&s->cv);
+        queue_poke(s);
+    }
 }
 
 static void handle_client_hello_locked(struct ps_session *s, const uint8_t *body, size_t len)
@@ -1621,8 +1879,12 @@ static void handle_server_hello_locked(struct ps_session *s, const uint8_t *body
     if (s->peer_len)
         ps_addr_set_port((struct sockaddr *)&s->peer, s->peer_len, sh.data_port);
     become_negotiated_export(s);
-    for (unsigned i = 0; i < s->expect; i++)
-        open_one_locked(s);
+    if (s->transport_ready && s->transport == SPT_TRANSPORT_TCP) {
+        for (unsigned i = 0; i < s->expect; i++)
+            open_one_locked(s);
+    } else {
+        send_transport_offer_locked(s);
+    }
 }
 
 static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body, size_t len)
@@ -1630,6 +1892,13 @@ static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body
     if (!s->is_server || len != SPT_SUBFLOW_HELLO_LEN) {
         fail_locked(s, PS_ERR_PROTO);
         return;
+    }
+    if (!s->transport_ready) {
+        if (s->transport_pref == PS_TRANSPORT_RDMA_RC && !s->allow_tcp_fallback) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+        select_tcp_locked(s);
     }
     struct spt_subflow_hello msg;
     if (spt_subflow_hello_decode(body, &msg) != 0 || msg.key_generation != 0 ||
@@ -1655,7 +1924,10 @@ static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body
     sf->fd = -1;
     sf->used = 1;
     sf->id = msg.subflow_id;
-    sf->state = SF_WAIT_TCP;
+    sf->rdma = s->transport == SPT_TRANSPORT_RDMA_RC ? 1 : 0;
+    sf->state = sf->rdma ? SF_WAIT_RDMA : SF_WAIT_TCP;
+    if (sf->rdma)
+        sf->rdma_credit = s->rdma_recv_depth;
     memcpy(sf->client_nonce, msg.nonce, SPT_NONCE_LEN);
     if (RAND_bytes(sf->server_nonce, SPT_NONCE_LEN) != 1) {
         fail_locked(s, PS_ERR_CRYPTO);
@@ -1668,6 +1940,10 @@ static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body
     }
     if (sf_alloc_rx(s, sf) != 0) {
         fail_locked(s, PS_ERR_NOMEM);
+        return;
+    }
+    if (sf->rdma && authorize_lane_locked(s, sf) != 0) {
+        fail_locked(s, PS_ERR_IO);
         return;
     }
     struct spt_subflow_hello ack;
@@ -1697,6 +1973,14 @@ static void handle_subflow_accept_locked(struct ps_session *s, const uint8_t *bo
     }
     memcpy(sf->server_nonce, msg.nonce, SPT_NONCE_LEN);
     sf->server_nonce_set = 1;
+    if (sf->rdma || s->transport == SPT_TRANSPORT_RDMA_RC) {
+        sf->rdma = 1;
+        sf->rdma_credit = s->rdma_recv_depth;
+        sf->state = SF_WAIT_RDMA;
+        sf->need_rdma = 1;
+        queue_poke(s);
+        return;
+    }
     if (!s->root_valid) {
         sf->state = SF_WAIT_TCP;
         sf->need_connect = 1;
@@ -1790,6 +2074,15 @@ static void handle_ctrl_locked(struct ps_session *s, uint16_t type, const uint8_
         on_rekey_locked(s, ps_get_u32(body), ps_get_u32(body + 4),
                         type == SPT_CTRL_KEY_UPDATE_ACK);
         break;
+    case SPT_CTRL_TRANSPORT_OFFER:
+        handle_transport_offer_locked(s, body, len);
+        break;
+    case SPT_CTRL_TRANSPORT_SELECT:
+        handle_transport_select_locked(s, body, len);
+        break;
+    case SPT_CTRL_RDMA_CREDIT:
+        handle_rdma_credit_locked(s, body, len);
+        break;
     case SPT_CTRL_PROTECTION: {
         if (len != 4 || body[2] != 0 || body[3] != 0) {
             fail_locked(s, PS_ERR_PROTO);
@@ -1858,7 +2151,9 @@ static void client_begin(struct ps_session *s)
     s->hw = hw;
     unsigned n = s->initial_sockets;
     if (n == 0) {
-        if (s->scale_mode == PS_SCALE_FIXED)
+        if (s->transport_pref == PS_TRANSPORT_RDMA_RC)
+            n = 1;
+        else if (s->scale_mode == PS_SCALE_FIXED)
             n = s->max_sockets;
         else
             n = ps_suggest_sockets(&hw, s->min_sockets, s->max_sockets);
@@ -2232,6 +2527,36 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
     s->connect_timeout_ms = o.connect_timeout_ms;
     s->io_timeout_ms = o.io_timeout_ms;
     s->advertised = s->recv_window;
+    if (o.transport != PS_TRANSPORT_AUTO && o.transport != PS_TRANSPORT_TCP &&
+        o.transport != PS_TRANSPORT_RDMA_RC)
+        o.transport = PS_TRANSPORT_TCP;
+    s->transport_pref = o.transport;
+    s->allow_tcp_fallback = o.allow_tcp_fallback ? 1 : 0;
+    if (s->transport_pref == PS_TRANSPORT_AUTO)
+        s->allow_tcp_fallback = 1;
+    s->rdma_send_depth = o.rdma_send_depth ? o.rdma_send_depth : 16;
+    s->rdma_recv_depth = o.rdma_recv_depth ? o.rdma_recv_depth : 64;
+    s->rdma_cq_budget = o.rdma_cq_poll_budget ? o.rdma_cq_poll_budget : 32;
+    if (s->rdma_send_depth < 2)
+        s->rdma_send_depth = 2;
+    if (s->rdma_send_depth > 256)
+        s->rdma_send_depth = 256;
+    if (s->rdma_recv_depth < 4)
+        s->rdma_recv_depth = 4;
+    if (s->rdma_recv_depth > 256)
+        s->rdma_recv_depth = 256;
+    if (s->rdma_cq_budget == 0)
+        s->rdma_cq_budget = 32;
+    if (s->rdma_cq_budget > 128)
+        s->rdma_cq_budget = 128;
+    if (o.rdma_device && o.rdma_device[0])
+        s->rdma_device = dupstr(o.rdma_device);
+    if (s->transport_pref == PS_TRANSPORT_RDMA_RC)
+        s->scale_mode = PS_SCALE_FIXED;
+    if (!s->is_server && s->transport_pref == PS_TRANSPORT_TCP) {
+        s->transport = SPT_TRANSPORT_TCP;
+        s->transport_ready = 1;
+    }
 }
 
 static void session_destroy(struct ps_session *s)
@@ -2247,6 +2572,12 @@ static void session_destroy(struct ps_session *s)
         for (uint32_t i = 0; i < s->sf_count; i++) {
             if (s->sf[i].fd >= 0)
                 s->io.stop_io(s->io.ctx, s->sf[i].fd);
+        }
+        if (s->rdma) {
+            int rfds[2];
+            int nr = ps_rdma_fds(s->rdma, rfds, 2);
+            for (int i = 0; i < nr; i++)
+                s->io.stop_io(s->io.ctx, rfds[i]);
         }
     }
     if (s->ssl) {
@@ -2304,6 +2635,9 @@ static void session_destroy(struct ps_session *s)
     buf_free(&s->cin);
     buf_free(&s->cout);
     OPENSSL_cleanse(s->root, sizeof(s->root));
+    ps_rdma_close(s->rdma);
+    s->rdma = NULL;
+    free(s->rdma_device);
     free(s->server_name);
     free(s->tids);
     if (s->ctx)
@@ -2601,6 +2935,8 @@ void ps_session_install_root(ps_session_t *session, const uint8_t root[32])
             struct subflow *sf = &session->sf[i];
             if (sf->used && sf->server_nonce_set && ensure_keys_locked(session, sf) != 0)
                 fail_locked(session, PS_ERR_CRYPTO);
+            if (sf->used && sf->rdma && authorize_lane_locked(session, sf) != 0)
+                fail_locked(session, PS_ERR_IO);
         }
     }
     unlock_s(session);
@@ -2987,7 +3323,8 @@ static unsigned opening_count(const struct ps_session *s)
     unsigned n = 0;
     for (uint32_t i = 0; i < s->sf_count; i++) {
         int st = s->sf[i].state;
-        if (s->sf[i].used && (st == SF_OPEN_SENT || st == SF_WAIT_TCP || st == SF_JOINING))
+        if (s->sf[i].used && (st == SF_OPEN_SENT || st == SF_WAIT_TCP || st == SF_WAIT_RDMA ||
+                              st == SF_JOINING))
             n++;
     }
     return n;
@@ -3327,14 +3664,323 @@ int ps_session_rekey_wait(ps_session_t *session, uint32_t timeout_ms)
     return PS_OK;
 }
 
+static void rdma_mark_up_locked(struct ps_session *s, uint32_t id)
+{
+    struct subflow *sf = sf_by_id(s, id);
+    if (!sf || !sf->rdma) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    sf->rdma_up = 1;
+    sf->connecting = 0;
+    sf->want_read = 1;
+    sf->rdma_credit = s->rdma_recv_depth;
+    sf->rdma_recv_posted = s->rdma_recv_depth;
+    sf->rdma_credit_sent = s->rdma_recv_depth;
+    if (s->is_server)
+        return;
+    if (ensure_keys_locked(s, sf) != 0) {
+        fail_locked(s, PS_ERR_CRYPTO);
+        return;
+    }
+    sf->state = SF_JOINING;
+    struct spt_join_plain join;
+    memset(&join, 0, sizeof(join));
+    join.role = SPT_ROLE_CLIENT;
+    join.subflow_id = sf->id;
+    memcpy(join.session_id, s->session_id, SPT_SESSION_ID_LEN);
+    memcpy(join.client_nonce, sf->client_nonce, SPT_NONCE_LEN);
+    memcpy(join.server_nonce, sf->server_nonce, SPT_NONCE_LEN);
+    memcpy(join.hello_hash, s->hello_hash, SPT_HASH_LEN);
+    uint8_t raw[SPT_JOIN_PLAIN_LEN];
+    if (spt_join_encode(raw, &join) != 0 ||
+        enqueue_record_locked(s, sf, SPT_REC_JOIN, 0, 0, raw, SPT_JOIN_PLAIN_LEN,
+                              SPT_PROTECTION_CONFIDENTIAL) != 0)
+        fail_locked(s, PS_ERR_PROTO);
+    else
+        refresh_write_locked(s, sf);
+}
+
+static int rdma_append_locked(struct ps_session *s, uint32_t lane, const uint8_t *data, size_t len)
+{
+    struct subflow *sf = sf_by_id(s, lane);
+    size_t max = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (!sf || !sf->rdma || !data || len < SPT_FRAME_HEADER_LEN || len > max) {
+        fail_locked(s, PS_ERR_PROTO);
+        return -1;
+    }
+    if (!sf->rx || sf->read_paused)
+        return 1;
+    if (sf->rx_cap - sf->rx_len < len && sf->rx_off > 0)
+        rx_compact(sf);
+    if (sf->rx_cap - sf->rx_len < len)
+        return 1;
+    memcpy(sf->rx + sf->rx_len, data, len);
+    sf->rx_len += len;
+    return 0;
+}
+
+static void rdma_note_recv_locked(struct ps_session *s, struct subflow *sf)
+{
+    if (!sf)
+        return;
+    sf->rdma_recv_posted++;
+    uint32_t step = s->rdma_recv_depth / 4;
+    if (step < 8)
+        step = 8;
+    if (sf->rdma_recv_posted < sf->rdma_credit_sent ||
+        sf->rdma_recv_posted - sf->rdma_credit_sent < step)
+        return;
+    uint8_t body[SPT_RDMA_CREDIT_LEN];
+    ps_put_u32(body, sf->id);
+    ps_put_u32(body + 4, sf->rdma_recv_posted);
+    if (queue_ctrl_locked(s, SPT_CTRL_RDMA_CREDIT, body, sizeof(body)) == 0)
+        sf->rdma_credit_sent = sf->rdma_recv_posted;
+}
+
+static void rdma_parse_locked(struct ps_session *s)
+{
+    unsigned budget = s->max_poller_records ? s->max_poller_records : 1;
+    for (uint32_t i = 0; i < s->sf_count && s->state != PS_STATE_FAILED; i++) {
+        if (s->sf[i].used && s->sf[i].rdma)
+            parse_rx_locked(s, &s->sf[i], &budget);
+    }
+}
+
+static int rdma_flush_holds_locked(struct ps_session *s)
+{
+    int progressed = 0;
+    int i = 0;
+    while (i < s->rdma_nhold && s->state != PS_STATE_FAILED) {
+        struct rdma_hold *h = &s->rdma_hold[i];
+        int rc = rdma_append_locked(s, h->lane, h->data, h->len);
+        if (rc < 0)
+            return -1;
+        if (rc > 0)
+            break;
+        uint32_t lane = h->lane;
+        unsigned slot = h->slot;
+        memmove(h, h + 1, (size_t)(s->rdma_nhold - i - 1) * sizeof(*h));
+        s->rdma_nhold--;
+        unlock_s(s);
+        int recycled = ps_rdma_recycle(s->rdma, lane, slot);
+        lock_s(s);
+        if (recycled != 0) {
+            fail_locked(s, PS_ERR_IO);
+            return -1;
+        }
+        rdma_note_recv_locked(s, sf_by_id(s, lane));
+        progressed = 1;
+    }
+    return progressed;
+}
+
+static int rdma_post_sends(struct ps_session *s)
+{
+    struct ps_rdma *rdma = s->rdma;
+    if (!rdma)
+        return 0;
+    int any = 0;
+    for (uint32_t i = 0; i < PS_MAX_SUBFLOWS; i++) {
+        for (;;) {
+            lock_s(s);
+            struct subflow *sf = &s->sf[i];
+            if (s->state == PS_STATE_FAILED || !sf->used || !sf->rdma_up ||
+                sf->rdma_sent >= sf->rdma_credit) {
+                unlock_s(s);
+                break;
+            }
+            struct wire_slot *w = sf->out_head;
+            if (!w || !w->ready) {
+                unlock_s(s);
+                break;
+            }
+            if (!w->ok || w->off != 0 || w->len == 0) {
+                fail_locked(s, w->ok ? PS_ERR_PROTO : PS_ERR_CRYPTO);
+                unlock_s(s);
+                return -1;
+            }
+            uint8_t *frame = w->frame;
+            size_t len = w->len;
+            uint32_t id = sf->id;
+            s->send_hold++;
+            unlock_s(s);
+            int rc = ps_rdma_send(rdma, id, frame, len);
+            lock_s(s);
+            sf = sf_by_id(s, id);
+            if (s->send_hold)
+                s->send_hold--;
+            pthread_cond_broadcast(&s->cv);
+            if (!sf || s->state == PS_STATE_FAILED) {
+                unlock_s(s);
+                return -1;
+            }
+            if (rc > 0) {
+                unlock_s(s);
+                break;
+            }
+            if (rc != 0 || !sf->out_head || sf->out_head->frame != frame) {
+                fail_locked(s, PS_ERR_IO);
+                unlock_s(s);
+                return -1;
+            }
+            struct wire_slot *slot = sf->out_head;
+            sf->out_head = slot->next;
+            if (!sf->out_head)
+                sf->out_tail = NULL;
+            if (sf->out_bytes >= slot->len)
+                sf->out_bytes -= slot->len;
+            s->records_tx++;
+            sf->rdma_sent++;
+            frame_put_locked(s, slot->frame, slot->len);
+            free(slot);
+            try_end_locked(s, sf);
+            if (sf->tx_full && sf->out_bytes <= (s->sf_hi * 3) / 4)
+                sf->tx_full = 0;
+            if (!sf->tx_full && s->send_stalled)
+                pthread_cond_broadcast(&s->cv);
+            refresh_write_locked(s, sf);
+            any = 1;
+            unlock_s(s);
+        }
+    }
+    return any;
+}
+
+int ps_session_rdma_service(ps_session_t *session)
+{
+    if (!session)
+        return -PS_ERR_INVAL;
+    lock_s(session);
+    if (!session->rdma || session->rdma_serving) {
+        int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
+        unlock_s(session);
+        return err ? -err : PS_OK;
+    }
+    session->rdma_serving = 1;
+    struct ps_rdma *rdma = session->rdma;
+    unsigned budget = session->rdma_cq_budget ? session->rdma_cq_budget : 32;
+    unlock_s(session);
+
+    for (int loops = 0; loops < 8; loops++) {
+        int progressed = 0;
+        lock_s(session);
+        if (session->state == PS_STATE_FAILED) {
+            unlock_s(session);
+            break;
+        }
+        rdma_parse_locked(session);
+        int held = rdma_flush_holds_locked(session);
+        int pending = session->rdma_nhold;
+        int failed = session->state == PS_STATE_FAILED;
+        unlock_s(session);
+        if (held < 0 || failed)
+            break;
+        if (held > 0)
+            progressed = 1;
+        if (pending)
+            break;
+        struct ps_rdma_event ev[16];
+        int n = ps_rdma_progress(rdma, ev, 16, budget);
+        if (n < 0) {
+            ps_session_fail(session, PS_ERR_IO);
+            break;
+        }
+        if (n > 0)
+            progressed = 1;
+        int stop = 0;
+        for (int i = 0; i < n && !stop; i++) {
+            if (ev[i].type == PS_RDMA_EV_CONNECTED) {
+                lock_s(session);
+                rdma_mark_up_locked(session, ev[i].lane);
+                failed = session->state == PS_STATE_FAILED;
+                unlock_s(session);
+                if (failed)
+                    stop = 1;
+            } else if (ev[i].type == PS_RDMA_EV_ERROR) {
+                ps_session_fail(session, PS_ERR_IO);
+                stop = 1;
+            } else if (ev[i].type == PS_RDMA_EV_RECV) {
+                lock_s(session);
+                int rc = rdma_append_locked(session, ev[i].lane, ev[i].data, ev[i].len);
+                if (rc < 0) {
+                    unlock_s(session);
+                    stop = 1;
+                    break;
+                }
+                if (rc > 0) {
+                    if (session->rdma_nhold >= RDMA_HOLD_MAX) {
+                        fail_locked(session, PS_ERR_FLOW);
+                        unlock_s(session);
+                        stop = 1;
+                        break;
+                    }
+                    struct rdma_hold *h = &session->rdma_hold[session->rdma_nhold++];
+                    memset(h, 0, sizeof(*h));
+                    h->used = 1;
+                    h->lane = ev[i].lane;
+                    h->slot = ev[i].slot;
+                    h->data = ev[i].data;
+                    h->len = ev[i].len;
+                    unlock_s(session);
+                    continue;
+                }
+                uint32_t lane = ev[i].lane;
+                unsigned slot = ev[i].slot;
+                unlock_s(session);
+                if (ps_rdma_recycle(rdma, lane, slot) != 0) {
+                    ps_session_fail(session, PS_ERR_IO);
+                    stop = 1;
+                    break;
+                }
+                lock_s(session);
+                rdma_note_recv_locked(session, sf_by_id(session, lane));
+                unlock_s(session);
+            }
+        }
+        lock_s(session);
+        if (session->state != PS_STATE_FAILED)
+            rdma_parse_locked(session);
+        failed = session->state == PS_STATE_FAILED;
+        unlock_s(session);
+        if (stop || failed)
+            break;
+        int posted = rdma_post_sends(session);
+        if (posted < 0)
+            break;
+        if (posted > 0)
+            progressed = 1;
+        if (!progressed)
+            break;
+    }
+
+    lock_s(session);
+    int more = session->rdma_nhold > 0;
+    for (uint32_t i = 0; i < session->sf_count && !more; i++) {
+        struct subflow *sf = &session->sf[i];
+        if (sf->rdma_up && sf->out_head && sf->out_head->ready && sf->rdma_sent < sf->rdma_credit)
+            more = 1;
+    }
+    if (more && session->state != PS_STATE_FAILED)
+        queue_poke(session);
+    session->rdma_serving = 0;
+    int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
+    unlock_s(session);
+    dispatch(session);
+    return err ? -err : PS_OK;
+}
+
 int ps_embed_service(ps_session_t *session)
 {
     if (!session)
         return -PS_ERR_INVAL;
     int closing[PS_MAX_SUBFLOWS];
     uint32_t connect_ids[PS_MAX_SUBFLOWS];
+    uint32_t rdma_ids[PS_MAX_SUBFLOWS];
+    uint8_t rdma_tokens[PS_MAX_SUBFLOWS][SPT_RDMA_TOKEN_LEN];
     int nclose = 0;
     int nconn = 0;
+    int nrdma = 0;
     lock_s(session);
     for (uint32_t i = 0; i < session->sf_count; i++) {
         struct subflow *sf = &session->sf[i];
@@ -3350,9 +3996,26 @@ int ps_embed_service(ps_session_t *session)
             sf->connecting = 1;
             connect_ids[nconn++] = sf->id;
         }
+        if (sf->need_rdma && !sf->rdma_started && session->root_valid && session->rdma &&
+            session->peer_len && session->rdma_port) {
+            uint8_t token[SPT_RDMA_TOKEN_LEN];
+            if (lane_token_locked(session, sf, token) != 0) {
+                fail_locked(session, PS_ERR_CRYPTO);
+                break;
+            }
+            sf->need_rdma = 0;
+            sf->rdma_started = 1;
+            rdma_ids[nrdma] = sf->id;
+            memcpy(rdma_tokens[nrdma], token, SPT_RDMA_TOKEN_LEN);
+            OPENSSL_cleanse(token, sizeof(token));
+            nrdma++;
+        }
     }
     struct sockaddr_storage peer = session->peer;
     socklen_t peer_len = session->peer_len;
+    uint16_t rdma_port = session->rdma_port;
+    struct ps_rdma *rdma = session->rdma;
+    int failed = session->state == PS_STATE_FAILED;
     unlock_s(session);
     dispatch(session);
     for (int i = 0; i < nclose; i++)
@@ -3388,11 +4051,19 @@ int ps_embed_service(ps_session_t *session)
             unlock_s(session);
         }
     }
+    if (!failed && rdma) {
+        for (int i = 0; i < nrdma; i++) {
+            struct sockaddr_storage addr = peer;
+            if (peer_len == 0 ||
+                ps_addr_set_port((struct sockaddr *)&addr, peer_len, rdma_port) != 0 ||
+                ps_rdma_connect(rdma, rdma_ids[i], (struct sockaddr *)&addr, peer_len,
+                                rdma_tokens[i]) != 0)
+                ps_session_fail(session, PS_ERR_IO);
+            OPENSSL_cleanse(rdma_tokens[i], SPT_RDMA_TOKEN_LEN);
+        }
+    }
     ps_session_progress(session);
-    lock_s(session);
-    int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
-    unlock_s(session);
-    return err ? -err : PS_OK;
+    return ps_session_rdma_service(session);
 }
 
 unsigned ps_session_io_lanes(const ps_session_t *session)
@@ -3453,8 +4124,55 @@ int ps_session_watches(const ps_session_t *session, struct ps_watch *out, int ma
         out[n].want_write = s->sf[i].want_write;
         n++;
     }
+    if (s->rdma && n < max) {
+        int rfds[2];
+        int nr = ps_rdma_fds(s->rdma, rfds, 2);
+        for (int i = 0; i < nr && n < max; i++) {
+            int seen = 0;
+            for (int j = 0; j < n; j++) {
+                if (out[j].fd == rfds[i])
+                    seen = 1;
+            }
+            if (seen || rfds[i] < 0)
+                continue;
+            out[n].fd = rfds[i];
+            out[n].want_read = 1;
+            out[n].want_write = 0;
+            n++;
+        }
+    }
     unlock_s(s);
     return n;
+}
+
+int ps_session_transport(const ps_session_t *session)
+{
+    if (!session)
+        return 0;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    int transport = s->transport_ready ? (int)s->transport : 0;
+    unlock_s(s);
+    return transport;
+}
+
+int ps_session_is_rdma_fd(const ps_session_t *session, int fd)
+{
+    if (!session || fd < 0)
+        return 0;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    int yes = 0;
+    if (s->rdma) {
+        int rfds[2];
+        int nr = ps_rdma_fds(s->rdma, rfds, 2);
+        for (int i = 0; i < nr; i++) {
+            if (rfds[i] == fd)
+                yes = 1;
+        }
+    }
+    unlock_s(s);
+    return yes;
 }
 
 static void fill_stats_locked(struct ps_session *s, struct ps_stats *out)

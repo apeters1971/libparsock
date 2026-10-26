@@ -55,6 +55,7 @@ struct ps_listener {
     char *key;
     char *ca;
     char *sni;
+    char *rdma_device;
     pthread_t data_thread;
     pthread_mutex_t mu;
     int stop;
@@ -193,10 +194,14 @@ static int lane_owns(const struct io_lane *lane, int fd)
 static void lane_fill(struct io_lane *lane, int *read_again)
 {
     struct ps_runtime *rt = lane->rt;
-    struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
-    int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
+    if (lane->index == 0)
+        ps_session_rdma_service(rt->session);
+    struct ps_watch watches[PS_MAX_SUBFLOWS + 4];
+    int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 4);
     int again_left = 0;
     for (int i = 0; i < nw; i++) {
+        if (ps_session_is_rdma_fd(rt->session, watches[i].fd))
+            continue;
         if (!lane_owns(lane, watches[i].fd))
             continue;
         if (ps_session_is_control(rt->session, watches[i].fd))
@@ -233,17 +238,22 @@ static void *runtime_main(void *arg)
             break;
         if (read_again)
             lane_fill(lane, &read_again);
-        struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
-        int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
-        struct pollfd pfds[PS_MAX_SUBFLOWS + 3];
+        struct ps_watch watches[PS_MAX_SUBFLOWS + 4];
+        int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 4);
+        struct pollfd pfds[PS_MAX_SUBFLOWS + 5];
         int np = 0;
         pfds[np].fd = lane->wake_r;
         pfds[np].events = POLLIN;
         pfds[np].revents = 0;
         np++;
         for (int i = 0; i < nw; i++) {
-            if (!lane_owns(lane, watches[i].fd))
+            int rdma_fd = ps_session_is_rdma_fd(rt->session, watches[i].fd);
+            if (rdma_fd) {
+                if (lane->index != 0)
+                    continue;
+            } else if (!lane_owns(lane, watches[i].fd)) {
                 continue;
+            }
             short ev = 0;
             if (watches[i].want_read)
                 ev = (short)(ev | POLLIN);
@@ -274,7 +284,9 @@ static void *runtime_main(void *arg)
             int fd = watches[i - 1].fd;
             int control = ps_session_is_control(rt->session, fd);
             if (ev & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
-                if (control)
+                if (ps_session_is_rdma_fd(rt->session, fd))
+                    ps_session_rdma_service(rt->session);
+                else if (control)
                     ps_on_readable(rt->session, fd);
                 else {
                     int again = 0;
@@ -547,6 +559,10 @@ ps_listener_t *ps_listen(const char *host, uint16_t port, const struct ps_option
         ln->opt = *options;
     else
         ps_options_init(&ln->opt);
+    if (ln->opt.rdma_device && ln->opt.rdma_device[0]) {
+        ln->rdma_device = strdup(ln->opt.rdma_device);
+        ln->opt.rdma_device = ln->rdma_device;
+    }
     ln->opt.tls = &ln->tls;
     ln->ctx = ps_tls_server_ctx(&ln->tls);
     if (!ln->ctx) {
@@ -594,6 +610,7 @@ void ps_listener_close(ps_listener_t *listener)
     free(listener->key);
     free(listener->ca);
     free(listener->sni);
+    free(listener->rdma_device);
     pthread_mutex_destroy(&listener->mu);
     free(listener);
 }
@@ -832,6 +849,11 @@ int ps_close(ps_connection_t *conn)
     free(conn->rt);
     free(conn);
     return 0;
+}
+
+int ps_connection_transport(const ps_connection_t *conn)
+{
+    return conn ? ps_session_transport(conn->session) : 0;
 }
 
 int ps_connection_error(const ps_connection_t *conn)

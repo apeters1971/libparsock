@@ -22,6 +22,11 @@ void ps_options_init(struct ps_options *opt)
     opt->io_timeout_ms = 120000;
     opt->max_poller_bytes = 4ull << 20;
     opt->max_poller_records = 64;
+    opt->transport = PS_TRANSPORT_TCP;
+    opt->rdma_send_depth = 16;
+    opt->rdma_recv_depth = 64;
+    opt->rdma_cq_poll_budget = 32;
+    opt->allow_tcp_fallback = 1;
 }
 
 const char *ps_strerror(int err)

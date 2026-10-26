@@ -45,6 +45,10 @@ extern "C" {
 #define SPT_WINDOW_LEN 8
 #define SPT_ID_LEN 4
 #define SPT_KEY_UPDATE_LEN 8
+#define SPT_TRANSPORT_OFFER_LEN 24
+#define SPT_TRANSPORT_SELECT_LEN 16
+#define SPT_RDMA_CREDIT_LEN 8
+#define SPT_RDMA_TOKEN_LEN 32
 
 #define SPT_MAX_PLAIN (256u * 1024u)
 #define SPT_MAX_FRAME (SPT_FRAME_HEADER_LEN + SPT_MAX_PLAIN + SPT_TAG_LEN)
@@ -104,7 +108,15 @@ enum {
     SPT_CTRL_SCALE_REQUEST = 11,
     SPT_CTRL_KEY_UPDATE = 12,
     SPT_CTRL_KEY_UPDATE_ACK = 13,
-    SPT_CTRL_PROTECTION = 14
+    SPT_CTRL_PROTECTION = 14,
+    SPT_CTRL_TRANSPORT_OFFER = 15,
+    SPT_CTRL_TRANSPORT_SELECT = 16,
+    SPT_CTRL_RDMA_CREDIT = 17
+};
+
+enum {
+    SPT_TRANSPORT_TCP = 1,
+    SPT_TRANSPORT_RDMA_RC = 2
 };
 
 enum {
@@ -170,6 +182,24 @@ struct spt_subflow_hello {
     uint8_t nonce[SPT_NONCE_LEN];
 };
 
+struct spt_transport_offer {
+    uint8_t preference;
+    uint8_t fallback;
+    uint32_t initial_lanes;
+    uint32_t max_lanes;
+    uint32_t send_depth;
+    uint32_t recv_depth;
+    uint32_t max_message;
+};
+
+struct spt_transport_select {
+    uint8_t transport;
+    uint16_t rdma_port;
+    uint32_t lanes;
+    uint32_t send_depth;
+    uint32_t recv_depth;
+};
+
 struct spt_join_plain {
     uint8_t role;
     uint32_t subflow_id;
@@ -210,6 +240,23 @@ int spt_preface_decode(const uint8_t in[SPT_PREFACE_LEN], uint32_t *subflow_id,
 
 int spt_join_encode(uint8_t out[SPT_JOIN_PLAIN_LEN], const struct spt_join_plain *msg);
 int spt_join_decode(const uint8_t in[SPT_JOIN_PLAIN_LEN], struct spt_join_plain *msg);
+
+int spt_transport_offer_encode(uint8_t out[SPT_TRANSPORT_OFFER_LEN],
+                               const struct spt_transport_offer *msg);
+int spt_transport_offer_decode(const uint8_t in[SPT_TRANSPORT_OFFER_LEN],
+                               struct spt_transport_offer *msg);
+int spt_transport_select_encode(uint8_t out[SPT_TRANSPORT_SELECT_LEN],
+                                const struct spt_transport_select *msg);
+int spt_transport_select_decode(const uint8_t in[SPT_TRANSPORT_SELECT_LEN],
+                                struct spt_transport_select *msg);
+
+/* Binds an RDMA connection private-data token to the SPT session. */
+int spt_rdma_token(const uint8_t root[SPT_ROOT_LEN],
+                   uint32_t lane_id,
+                   const uint8_t client_nonce[SPT_NONCE_LEN],
+                   const uint8_t server_nonce[SPT_NONCE_LEN],
+                   const uint8_t session_id[SPT_SESSION_ID_LEN],
+                   uint8_t out[SPT_RDMA_TOKEN_LEN]);
 
 void spt_nonce(uint8_t out[SPT_IV_LEN], const uint8_t static_iv[SPT_IV_LEN],
                uint64_t record_sequence);

@@ -20,6 +20,21 @@ find_package(OpenSSL 3.0 REQUIRED)
 find_package(Threads REQUIRED)
 
 option(PARSOCK_ASAN "Build with AddressSanitizer" OFF)
+option(PARSOCK_RDMA "Build the RDMA RC backend when librdmacm is available" ON)
+set(PARSOCK_HAVE_RDMA OFF)
+if(PARSOCK_RDMA)
+    find_path(RDMA_INCLUDE_DIR rdma/rdma_cma.h)
+    find_library(RDMA_CM_LIBRARY rdmacm)
+    find_library(IBVERBS_LIBRARY ibverbs)
+    if(RDMA_INCLUDE_DIR AND RDMA_CM_LIBRARY AND IBVERBS_LIBRARY)
+        set(PARSOCK_HAVE_RDMA ON)
+    endif()
+endif()
+if(PARSOCK_HAVE_RDMA)
+    message(STATUS "libparsock RDMA backend: ON")
+else()
+    message(STATUS "libparsock RDMA backend: OFF")
+endif()
 
 add_library(parsock STATIC
     src/log.c
@@ -32,6 +47,7 @@ add_library(parsock STATIC
     src/tls.c
     src/options.c
     src/session.c
+    src/rdma.c
     src/drive.c
     src/standalone.c
 )
@@ -41,6 +57,11 @@ target_include_directories(parsock
 )
 target_link_libraries(parsock PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_compile_options(parsock PRIVATE -Wall -Wextra -Werror)
+if(PARSOCK_HAVE_RDMA)
+    target_compile_definitions(parsock PRIVATE PARSOCK_HAVE_RDMA=1)
+    target_include_directories(parsock PRIVATE ${RDMA_INCLUDE_DIR})
+    target_link_libraries(parsock PUBLIC ${RDMA_CM_LIBRARY} ${IBVERBS_LIBRARY})
+endif()
 
 if(PARSOCK_ASAN)
     target_compile_options(parsock PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
@@ -71,6 +92,7 @@ function(parsock_test name)
 endfunction()
 
 parsock_test(test_frame tests/test_frame.c)
+parsock_test(test_rdma tests/test_rdma.c)
 parsock_test(test_crypto tests/test_crypto.c)
 parsock_test(test_reassembly tests/test_reassembly.c)
 parsock_test(test_autoscale tests/test_autoscale.c)
@@ -80,6 +102,7 @@ parsock_test(test_protect tests/test_protect.c)
 
 enable_testing()
 add_test(NAME frame COMMAND test_frame)
+add_test(NAME rdma COMMAND test_rdma)
 add_test(NAME crypto COMMAND test_crypto)
 add_test(NAME reassembly COMMAND test_reassembly)
 add_test(NAME autoscale COMMAND test_autoscale)

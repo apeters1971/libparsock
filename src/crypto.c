@@ -388,3 +388,37 @@ int spt_aead_open(uint16_t alg,
     spt_aead_ctx_free(ctx);
     return rc;
 }
+
+int spt_rdma_token(const uint8_t root[SPT_ROOT_LEN],
+                   uint32_t lane_id,
+                   const uint8_t client_nonce[SPT_NONCE_LEN],
+                   const uint8_t server_nonce[SPT_NONCE_LEN],
+                   const uint8_t session_id[SPT_SESSION_ID_LEN],
+                   uint8_t out[SPT_RDMA_TOKEN_LEN])
+{
+    if (!root || !client_nonce || !server_nonce || !session_id || !out)
+        return -1;
+    uint8_t info[11 + 4 + SPT_NONCE_LEN + SPT_NONCE_LEN + SPT_SESSION_ID_LEN];
+    memcpy(info, "spt-rdma-v1", 11);
+    ps_put_u32(info + 11, lane_id);
+    memcpy(info + 15, client_nonce, SPT_NONCE_LEN);
+    memcpy(info + 47, server_nonce, SPT_NONCE_LEN);
+    memcpy(info + 79, session_id, SPT_SESSION_ID_LEN);
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *ctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+    char digest[] = "SHA256";
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_end()
+    };
+    size_t outl = 0;
+    int rc = -1;
+    if (ctx && EVP_MAC_init(ctx, root, SPT_ROOT_LEN, params) == 1 &&
+        EVP_MAC_update(ctx, info, sizeof(info)) == 1 &&
+        EVP_MAC_final(ctx, out, &outl, SPT_RDMA_TOKEN_LEN) == 1 && outl == SPT_RDMA_TOKEN_LEN)
+        rc = 0;
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(mac);
+    OPENSSL_cleanse(info, sizeof(info));
+    return rc;
+}

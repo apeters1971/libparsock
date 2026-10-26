@@ -251,3 +251,7 @@ An independent implementation has to reproduce:
 - AES-256-GCM, AES-128-GCM, and ChaCha20-Poly1305 seals, including empty plaintext, and rejection of a modified tag
 - HMAC-SHA-256 MAC keys for prefix `spt-mac-v1`, truncated to 16 bytes, and rejection of a modified plaintext or profile byte
 - nonce `static_iv XOR encode96(sequence)`
+
+## Extensions
+
+Data sockets in this document are TCP. [spt-rdma.md](spt-rdma.md) specifies an optional RDMA data plane. Peers that do not exchange its transport messages stay on TCP.

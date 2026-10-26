@@ -58,5 +58,8 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
 int ps_session_shutdown_write(ps_session_t *session);
 int ps_session_rekey_wait(ps_session_t *session, uint32_t timeout_ms);
 int ps_session_wait_flush(ps_session_t *session, uint32_t timeout_ms);
+int ps_session_transport(const ps_session_t *session);
+int ps_session_is_rdma_fd(const ps_session_t *session, int fd);
+int ps_session_rdma_service(ps_session_t *session);
 
 #endif

@@ -63,6 +63,9 @@ struct config {
     std::uint64_t window = 512ull << 20;
     bool verify = true;
     std::vector<unsigned> socket_list;
+    parsock::transport transport = parsock::transport::tcp;
+    bool tcp_fallback = false;
+    std::string rdma_device;
 };
 
 struct summary {
@@ -191,6 +194,26 @@ parsock::protection parse_protection(const std::string &text)
     throw std::runtime_error("unknown protection: " + text);
 }
 
+const char *transport_name(parsock::transport value)
+{
+    if (value == parsock::transport::rdma)
+        return "rdma";
+    if (value == parsock::transport::automatic)
+        return "auto";
+    return "tcp";
+}
+
+parsock::transport parse_transport(const std::string &text)
+{
+    if (text == "tcp")
+        return parsock::transport::tcp;
+    if (text == "rdma")
+        return parsock::transport::rdma;
+    if (text == "auto")
+        return parsock::transport::automatic;
+    throw std::runtime_error("unknown transport: " + text);
+}
+
 std::uint64_t parse_size(const std::string &text)
 {
     if (text.empty())
@@ -259,6 +282,7 @@ void usage()
         << "  spt_bench server [--cert CERT --key KEY] [--bind HOST] [--port N]\n"
         << "      [--aead aes-128-gcm|aes-256-gcm|chacha20-poly1305]\n"
         << "      [--sockets N] [--workers N] [--protection confidential|authenticated]\n"
+        << "      [--transport tcp|rdma|auto] [--tcp-fallback] [--rdma-device NAME]\n"
         << "      [--send FILE] [--recv FILE] [--bytes SIZE] [--seconds SEC]\n"
         << "      [--window SIZE] [--no-verify] [--hash] [--csv FILE] [--no-chart]\n"
         << "  spt_bench client HOST PORT [--cert CERT --key KEY] [same options]\n"
@@ -298,6 +322,12 @@ config parse_args(int argc, char **argv, std::vector<std::string> &positionals)
             cfg.workers = static_cast<unsigned>(std::stoul(need_value(i, argc, argv, "--workers")));
         else if (arg == "--protection")
             cfg.protection = parse_protection(need_value(i, argc, argv, "--protection"));
+        else if (arg == "--transport")
+            cfg.transport = parse_transport(need_value(i, argc, argv, "--transport"));
+        else if (arg == "--tcp-fallback")
+            cfg.tcp_fallback = true;
+        else if (arg == "--rdma-device")
+            cfg.rdma_device = need_value(i, argc, argv, "--rdma-device");
         else if (arg == "--send")
             cfg.send_path = need_value(i, argc, argv, "--send");
         else if (arg == "--recv")
@@ -516,7 +546,12 @@ parsock::options make_options(const config &cfg, const std::string &server_name,
         .frame_size(kFrame)
         .receive_window(cfg.window)
         .connect_timeout(10000)
-        .io_timeout(300000);
+        .io_timeout(300000)
+        .transport(cfg.transport);
+    if (cfg.tcp_fallback)
+        opt.tcp_fallback(true);
+    if (!cfg.rdma_device.empty())
+        opt.rdma_device(cfg.rdma_device);
     if (!server_name.empty())
         opt.server_name(server_name);
     return opt;
@@ -1113,8 +1148,13 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
         parsock::listener listener = parsock::listener::listen(cfg.bind_host, cfg.port, opt);
         const parsock::endpoints ports = listener.ports();
         std::cerr << "listening " << cfg.bind_host << ":" << ports.control << "  " << aead_name(cfg.cipher)
-                  << "  " << protection_name(cfg.protection) << "  sockets " << cfg.sockets << std::endl;
+                  << "  " << protection_name(cfg.protection) << "  sockets " << cfg.sockets;
+        if (cfg.transport != parsock::transport::tcp)
+            std::cerr << "  transport " << transport_name(cfg.transport);
+        std::cerr << std::endl;
         parsock::connection conn = listener.accept();
+        if (cfg.transport != parsock::transport::tcp)
+            std::cerr << "negotiated transport " << transport_name(conn.transport()) << std::endl;
         print_tcp_settings(conn);
         const summary result = run_transfer(conn, cfg, endpoint_title(cfg.bind_host, ports.control), chart_on,
                                              interval_stdout, csv.is_open() ? &csv : nullptr);
@@ -1128,6 +1168,8 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
     cfg.port = parse_port(positionals[1]);
     parsock::options opt = make_options(cfg, cfg.host, tls_use::client);
     parsock::connection conn = parsock::connection::connect(cfg.host, cfg.port, opt);
+    if (cfg.transport != parsock::transport::tcp)
+        std::cerr << "negotiated transport " << transport_name(conn.transport()) << std::endl;
     print_tcp_settings(conn);
     const summary result = run_transfer(conn, cfg, endpoint_title(cfg.host, cfg.port), chart_on, interval_stdout,
                                          csv.is_open() ? &csv : nullptr);

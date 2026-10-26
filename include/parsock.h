@@ -4,10 +4,12 @@
 /*
  * libparsock — userspace Secure Parallel Transport (SPT/0.1).
  *
- * One ordered bidirectional byte stream is carried on multiple TCP sockets.
- * A TLS 1.3 control connection authenticates the peers. Data sockets carry
- * custom AEAD records. The synchronous API below is a blocking wrapper around
- * the same session core used by the embedded readiness API.
+ * One ordered bidirectional byte stream is carried on multiple TCP sockets,
+ * or on RDMA Reliable Connected queue pairs when both peers select that
+ * transport. A TLS 1.3 control connection authenticates the peers and stays
+ * on TCP. Data is carried in custom AEAD records. The synchronous API below
+ * is a blocking wrapper around the same session core used by the embedded
+ * readiness API. The default transport is TCP.
  *
  * Callbacks run on the thread that entered the library, without internal locks
  * held. They may call ps_submit_send / ps_submit_recv. They must not call
@@ -41,6 +43,12 @@ typedef enum {
     PS_PROTECTION_CONFIDENTIAL = 0,
     PS_PROTECTION_AUTHENTICATED = 1
 } ps_protection_t;
+
+typedef enum {
+    PS_TRANSPORT_AUTO = 0,
+    PS_TRANSPORT_TCP = 1,
+    PS_TRANSPORT_RDMA_RC = 2
+} ps_transport_t;
 
 enum {
     PS_OK = 0,
@@ -94,6 +102,12 @@ struct ps_options {
     size_t max_poller_bytes;
     unsigned max_poller_records;
     const struct ps_tls_config *tls;
+    ps_transport_t transport;
+    unsigned rdma_send_depth;
+    unsigned rdma_recv_depth;
+    unsigned rdma_cq_poll_budget;
+    int allow_tcp_fallback;
+    const char *rdma_device;
 };
 
 struct ps_stats {
@@ -164,6 +178,9 @@ ssize_t ps_recv(ps_connection_t *conn, void *buffer, size_t length);
 int ps_shutdown(ps_connection_t *conn, int how);
 int ps_close(ps_connection_t *conn);
 
+/* Selected data-plane transport: PS_TRANSPORT_TCP or PS_TRANSPORT_RDMA_RC.
+   Zero until the peers have selected one. */
+int ps_connection_transport(const ps_connection_t *conn);
 int ps_connection_error(const ps_connection_t *conn);
 int ps_connection_state(const ps_connection_t *conn);
 int ps_connection_stats(const ps_connection_t *conn, struct ps_stats *out);
