@@ -48,7 +48,7 @@ void ps_session_scale_tick(ps_session_t *session);
 
 int ps_session_wait_open(ps_session_t *session, uint32_t timeout_ms);
 ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
-                             uint32_t timeout_ms);
+                             uint8_t protection, uint32_t timeout_ms);
 ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
                              uint32_t timeout_ms);
 int ps_session_shutdown_write(ps_session_t *session);

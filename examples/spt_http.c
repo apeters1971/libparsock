@@ -16,8 +16,8 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage:\n"
-            "  spt_http server cert key [port]\n"
-            "  spt_http client cert key host port bytes\n");
+            "  spt_http server cert key [port] [public]\n"
+            "  spt_http client cert key host port bytes [public]\n");
 }
 
 static uint8_t body_byte(size_t off)
@@ -89,7 +89,9 @@ static int run_server(struct ps_options *opt, uint16_t port)
             chunk = (size_t)left;
         for (size_t i = 0; i < chunk; i++)
             buf[i] = body_byte((size_t)(nbytes - left) + i);
-        ssize_t n = ps_send(conn, buf, chunk);
+        ssize_t n = opt->min_protection == PS_PROTECTION_AUTHENTICATED
+                        ? ps_send_protected(conn, buf, chunk, PS_PROTECTION_AUTHENTICATED)
+                        : ps_send(conn, buf, chunk);
         if (n <= 0) {
             ps_close(conn);
             ps_listener_close(ln);
@@ -173,13 +175,23 @@ int main(int argc, char **argv)
     opt.min_sockets = 4;
     opt.max_sockets = 4;
     opt.initial_sockets = 4;
-    if (strcmp(argv[1], "server") == 0)
-        return run_server(&opt, argc > 4 ? (uint16_t)atoi(argv[4]) : 0);
+    if (strcmp(argv[1], "server") == 0) {
+        int public_body = (argc > 4 && strcmp(argv[4], "public") == 0) ||
+                          (argc > 5 && strcmp(argv[5], "public") == 0);
+        uint16_t port = 0;
+        if (argc > 4 && strcmp(argv[4], "public") != 0)
+            port = (uint16_t)atoi(argv[4]);
+        if (public_body)
+            opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+        return run_server(&opt, port);
+    }
     if (strcmp(argv[1], "client") == 0) {
         if (argc < 7) {
             usage();
             return 2;
         }
+        if (argc > 7 && strcmp(argv[7], "public") == 0)
+            opt.min_protection = PS_PROTECTION_AUTHENTICATED;
         tls.server_name = argv[4];
         return run_client(&opt, argv[4], (uint16_t)atoi(argv[5]), strtoull(argv[6], NULL, 10));
     }

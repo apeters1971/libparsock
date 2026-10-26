@@ -33,8 +33,14 @@ typedef enum {
 
 typedef enum {
     PS_AEAD_AES_256_GCM = 1,
-    PS_AEAD_CHACHA20_POLY1305 = 2
+    PS_AEAD_CHACHA20_POLY1305 = 2,
+    PS_AEAD_AES_128_GCM = 3
 } ps_aead_t;
+
+typedef enum {
+    PS_PROTECTION_CONFIDENTIAL = 0,
+    PS_PROTECTION_AUTHENTICATED = 1
+} ps_protection_t;
 
 enum {
     PS_OK = 0,
@@ -82,6 +88,7 @@ struct ps_options {
     size_t frame_size;
     size_t receive_window;
     ps_aead_t aead;
+    ps_protection_t min_protection;
     uint32_t connect_timeout_ms;
     uint32_t io_timeout_ms;
     size_t max_poller_bytes;
@@ -145,6 +152,10 @@ int ps_listener_port(const ps_listener_t *listener, uint16_t *control_port,
                      uint16_t *data_port);
 
 ssize_t ps_send(ps_connection_t *conn, const void *buffer, size_t length);
+/* Copies the buffer. Authenticated sends succeed only when both peers set
+   min_protection to PS_PROTECTION_AUTHENTICATED. */
+ssize_t ps_send_protected(ps_connection_t *conn, const void *buffer, size_t length,
+                          ps_protection_t protection);
 ssize_t ps_recv(ps_connection_t *conn, void *buffer, size_t length);
 int ps_shutdown(ps_connection_t *conn, int how);
 int ps_close(ps_connection_t *conn);
@@ -169,8 +180,19 @@ void ps_embed_close(ps_session_t *session);
 
 int ps_on_readable(ps_session_t *session, int fd);
 int ps_on_writable(ps_session_t *session, int fd);
+/* The library copies buffer before ps_submit_send_protected returns.
+   completion_context is reserved and is not invoked. */
+struct ps_send_descriptor {
+    const void *buffer;
+    size_t length;
+    ps_protection_t protection;
+    void *completion_context;
+};
+
 int ps_submit_send(ps_session_t *session, const void *data, size_t length,
                    size_t *accepted);
+int ps_submit_send_protected(ps_session_t *session, const struct ps_send_descriptor *desc,
+                             size_t *accepted);
 int ps_submit_recv(ps_session_t *session, void *data, size_t length,
                    size_t *received);
 int ps_session_watches(const ps_session_t *session, struct ps_watch *out, int max);

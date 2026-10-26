@@ -151,10 +151,86 @@ static void roundtrip(uint16_t alg, const char *name)
     expect(memcmp(hash, abc, 32) == 0, "sha abc");
 }
 
+static void mac_roundtrip(void)
+{
+    uint8_t root[32], cn[32], sn[32], sid[32];
+    for (int i = 0; i < 32; i++) {
+        root[i] = (uint8_t)(i + 3);
+        cn[i] = (uint8_t)(0x11 + i);
+        sn[i] = (uint8_t)(0x51 + i);
+        sid[i] = (uint8_t)(0x91 + i);
+    }
+    uint8_t key[32], other[32], aead_key[32], iv[12];
+    expect(spt_derive_mac_key(root, SPT_DIR_C2S, 2, 0, SPT_MAC_HMAC_SHA256, cn, sn, sid, key) == 0,
+           "mac derive");
+    expect(spt_derive_mac_key(root, SPT_DIR_S2C, 2, 0, SPT_MAC_HMAC_SHA256, cn, sn, sid, other) == 0,
+           "mac other dir");
+    expect(memcmp(key, other, 32) != 0, "mac direction");
+    expect(spt_derive_aead_key(root, SPT_DIR_C2S, 2, 0, SPT_AEAD_AES_256_GCM, cn, sn, sid, aead_key,
+                               iv) == 0,
+           "aead beside mac");
+    expect(memcmp(key, aead_key, 32) != 0, "mac separated from aead");
+
+    uint8_t info[128];
+    size_t off = sizeof(SPT_HKDF_MAC_PREFIX) - 1;
+    memcpy(info, SPT_HKDF_MAC_PREFIX, off);
+    info[off++] = SPT_DIR_C2S;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = 2;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = 0;
+    info[off++] = SPT_MAC_HMAC_SHA256;
+    memcpy(info + off, cn, 32);
+    off += 32;
+    memcpy(info + off, sn, 32);
+    off += 32;
+    memcpy(info + off, sid, 32);
+    off += 32;
+    uint8_t okm[32];
+    expect(hkdf_sha256(root, 32, (const uint8_t *)SPT_HKDF_SALT, sizeof(SPT_HKDF_SALT) - 1, info, off,
+                       okm, sizeof(okm)) == 0,
+           "mac hkdf");
+    expect(memcmp(key, okm, 32) == 0, "mac hkdf match");
+
+    struct spt_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version = SPT_VERSION;
+    hdr.type = SPT_REC_DATA;
+    hdr.protection = SPT_PROTECTION_AUTHENTICATED;
+    hdr.plaintext_length = 8;
+    uint8_t aad[SPT_FRAME_HEADER_LEN];
+    expect(spt_header_encode(aad, &hdr) == 0, "mac aad");
+    uint8_t pt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t tag[16];
+    expect(spt_mac_sign(key, aad, pt, sizeof(pt), tag) == 0, "mac sign");
+    uint8_t msg[48];
+    memcpy(msg, aad, 40);
+    memcpy(msg + 40, pt, 8);
+    uint8_t full[32];
+    expect(hmac_sha256(key, 32, msg, sizeof(msg), full) == 0, "mac oracle");
+    expect(memcmp(full, tag, 16) == 0, "mac truncation");
+    expect(spt_mac_verify(key, aad, pt, sizeof(pt), tag) == 0, "mac verify");
+    uint8_t flipped[8];
+    memcpy(flipped, pt, 8);
+    flipped[0] ^= 1;
+    expect(spt_mac_verify(key, aad, flipped, sizeof(flipped), tag) != 0, "mac tamper");
+    aad[36] ^= 1;
+    expect(spt_mac_verify(key, aad, pt, sizeof(pt), tag) != 0, "mac profile");
+    expect(spt_mac_sign(key, aad, NULL, 0, tag) == 0, "mac empty");
+    expect(spt_mac_verify(key, aad, NULL, 0, tag) == 0, "mac empty verify");
+}
+
 int main(void)
 {
     roundtrip(SPT_AEAD_AES_256_GCM, "aes derive");
+    roundtrip(SPT_AEAD_AES_128_GCM, "aes128 derive");
     roundtrip(SPT_AEAD_CHACHA20_POLY1305, "chacha derive");
+    mac_roundtrip();
     if (fails) {
         fprintf(stderr, "%d crypto checks failed\n", fails);
         return 1;

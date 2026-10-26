@@ -24,6 +24,7 @@ extern "C" {
 #define SPT_EXPORTER_LABEL "EXPORTER-libparsock-spt/0.1"
 #define SPT_HKDF_SALT "spt-hkdf-salt-v1"
 #define SPT_HKDF_INFO_PREFIX "spt-aead-v1"
+#define SPT_HKDF_MAC_PREFIX "spt-mac-v1"
 
 #define SPT_ROOT_LEN 32
 #define SPT_KEY_LEN 32
@@ -54,7 +55,17 @@ extern "C" {
 
 enum {
     SPT_AEAD_AES_256_GCM = 1,
-    SPT_AEAD_CHACHA20_POLY1305 = 2
+    SPT_AEAD_CHACHA20_POLY1305 = 2,
+    SPT_AEAD_AES_128_GCM = 3
+};
+
+enum {
+    SPT_MAC_HMAC_SHA256 = 1
+};
+
+enum {
+    SPT_PROTECTION_CONFIDENTIAL = 0,
+    SPT_PROTECTION_AUTHENTICATED = 1
 };
 
 enum {
@@ -92,7 +103,8 @@ enum {
     SPT_CTRL_ERROR = 10,
     SPT_CTRL_SCALE_REQUEST = 11,
     SPT_CTRL_KEY_UPDATE = 12,
-    SPT_CTRL_KEY_UPDATE_ACK = 13
+    SPT_CTRL_KEY_UPDATE_ACK = 13,
+    SPT_CTRL_PROTECTION = 14
 };
 
 enum {
@@ -110,6 +122,7 @@ enum {
 struct spt_header {
     uint8_t version;
     uint8_t type;
+    uint8_t protection;
     uint16_t flags;
     uint32_t subflow_id;
     uint32_t key_generation;
@@ -117,6 +130,17 @@ struct spt_header {
     uint64_t logical_offset;
     uint32_t plaintext_length;
 };
+
+/* Confidential is stronger than authenticated. Unknown values are rejected. */
+static inline int spt_protection_accepts(uint8_t minimum, uint8_t record)
+{
+    if (record == SPT_PROTECTION_CONFIDENTIAL)
+        return minimum == SPT_PROTECTION_CONFIDENTIAL ||
+               minimum == SPT_PROTECTION_AUTHENTICATED;
+    if (record == SPT_PROTECTION_AUTHENTICATED)
+        return minimum == SPT_PROTECTION_AUTHENTICATED;
+    return 0;
+}
 
 struct spt_client_hello {
     uint16_t aead;
@@ -189,6 +213,28 @@ int spt_join_decode(const uint8_t in[SPT_JOIN_PLAIN_LEN], struct spt_join_plain 
 
 void spt_nonce(uint8_t out[SPT_IV_LEN], const uint8_t static_iv[SPT_IV_LEN],
                uint64_t record_sequence);
+
+int spt_derive_mac_key(const uint8_t root[SPT_ROOT_LEN],
+                      uint8_t direction,
+                      uint32_t subflow_id,
+                      uint32_t generation,
+                      uint16_t mac_alg,
+                      const uint8_t client_nonce[SPT_NONCE_LEN],
+                      const uint8_t server_nonce[SPT_NONCE_LEN],
+                      const uint8_t session_id[SPT_SESSION_ID_LEN],
+                      uint8_t key[SPT_KEY_LEN]);
+
+int spt_mac_sign(const uint8_t key[SPT_KEY_LEN],
+                 const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                 const uint8_t *data,
+                 size_t data_len,
+                 uint8_t tag[SPT_TAG_LEN]);
+
+int spt_mac_verify(const uint8_t key[SPT_KEY_LEN],
+                   const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                   const uint8_t *data,
+                   size_t data_len,
+                   const uint8_t tag[SPT_TAG_LEN]);
 
 int spt_derive_aead_key(const uint8_t root[SPT_ROOT_LEN],
                         uint8_t direction,

@@ -17,6 +17,7 @@ void ps_options_init(struct ps_options *opt)
     opt->frame_size = 65536;
     opt->receive_window = 8ull << 20;
     opt->aead = PS_AEAD_AES_256_GCM;
+    opt->min_protection = PS_PROTECTION_CONFIDENTIAL;
     opt->connect_timeout_ms = 10000;
     opt->io_timeout_ms = 120000;
     opt->max_poller_bytes = 1ull << 20;

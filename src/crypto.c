@@ -44,9 +44,39 @@ static const EVP_CIPHER *cipher_for(uint16_t alg)
 {
     if (alg == SPT_AEAD_AES_256_GCM)
         return EVP_aes_256_gcm();
+    if (alg == SPT_AEAD_AES_128_GCM)
+        return EVP_aes_128_gcm();
     if (alg == SPT_AEAD_CHACHA20_POLY1305)
         return EVP_chacha20_poly1305();
     return NULL;
+}
+
+static int hkdf_sha256(const uint8_t *ikm, size_t ikm_len, const uint8_t *info, size_t info_len,
+                       uint8_t *okm, size_t okm_len)
+{
+    static const char salt[] = SPT_HKDF_SALT;
+    int rc = -1;
+    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    EVP_KDF_CTX *ctx = kdf ? EVP_KDF_CTX_new(kdf) : NULL;
+    if (!ctx)
+        goto done;
+    int mode = EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND;
+    char digest[] = "SHA256";
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, (void *)ikm, ikm_len),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, (void *)salt, sizeof(salt) - 1),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, (void *)info, info_len),
+        OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
+        OSSL_PARAM_construct_end()
+    };
+    if (EVP_KDF_derive(ctx, okm, okm_len, params) != 1)
+        goto done;
+    rc = 0;
+done:
+    EVP_KDF_CTX_free(ctx);
+    EVP_KDF_free(kdf);
+    return rc;
 }
 
 int spt_derive_aead_key(const uint8_t root[SPT_ROOT_LEN],
@@ -83,35 +113,105 @@ int spt_derive_aead_key(const uint8_t root[SPT_ROOT_LEN],
     memcpy(info + off, session_id, SPT_SESSION_ID_LEN);
     off += SPT_SESSION_ID_LEN;
 
-    static const char salt[] = SPT_HKDF_SALT;
     uint8_t okm[SPT_KEY_LEN + SPT_IV_LEN];
-    int rc = -1;
-    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
-    EVP_KDF_CTX *ctx = kdf ? EVP_KDF_CTX_new(kdf) : NULL;
-    if (!ctx)
-        goto done;
-
-    int mode = EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND;
-    char digest[] = "SHA256";
-    OSSL_PARAM params[] = {
-        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, (void *)root, SPT_ROOT_LEN),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, (void *)salt, sizeof(salt) - 1),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, info, off),
-        OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
-        OSSL_PARAM_construct_end()
-    };
-    if (EVP_KDF_derive(ctx, okm, sizeof(okm), params) != 1)
-        goto done;
-    memcpy(key, okm, SPT_KEY_LEN);
-    memcpy(static_iv, okm + SPT_KEY_LEN, SPT_IV_LEN);
-    rc = 0;
-done:
-    EVP_KDF_CTX_free(ctx);
-    EVP_KDF_free(kdf);
+    int rc = hkdf_sha256(root, SPT_ROOT_LEN, info, off, okm, sizeof(okm));
+    if (rc == 0) {
+        memcpy(key, okm, SPT_KEY_LEN);
+        memcpy(static_iv, okm + SPT_KEY_LEN, SPT_IV_LEN);
+    }
     OPENSSL_cleanse(okm, sizeof(okm));
     OPENSSL_cleanse(info, sizeof(info));
     return rc;
+}
+
+int spt_derive_mac_key(const uint8_t root[SPT_ROOT_LEN],
+                      uint8_t direction,
+                      uint32_t subflow_id,
+                      uint32_t generation,
+                      uint16_t mac_alg,
+                      const uint8_t client_nonce[SPT_NONCE_LEN],
+                      const uint8_t server_nonce[SPT_NONCE_LEN],
+                      const uint8_t session_id[SPT_SESSION_ID_LEN],
+                      uint8_t key[SPT_KEY_LEN])
+{
+    if (!root || !client_nonce || !server_nonce || !session_id || !key)
+        return -1;
+    if (direction > SPT_DIR_S2C || mac_alg != SPT_MAC_HMAC_SHA256)
+        return -1;
+
+    uint8_t info[10 + 1 + 4 + 4 + 2 + SPT_NONCE_LEN + SPT_NONCE_LEN + SPT_SESSION_ID_LEN];
+    size_t prefix_len = sizeof(SPT_HKDF_MAC_PREFIX) - 1;
+    memcpy(info, SPT_HKDF_MAC_PREFIX, prefix_len);
+    size_t off = prefix_len;
+    info[off++] = direction;
+    ps_put_u32(info + off, subflow_id);
+    off += 4;
+    ps_put_u32(info + off, generation);
+    off += 4;
+    ps_put_u16(info + off, mac_alg);
+    off += 2;
+    memcpy(info + off, client_nonce, SPT_NONCE_LEN);
+    off += SPT_NONCE_LEN;
+    memcpy(info + off, server_nonce, SPT_NONCE_LEN);
+    off += SPT_NONCE_LEN;
+    memcpy(info + off, session_id, SPT_SESSION_ID_LEN);
+    off += SPT_SESSION_ID_LEN;
+
+    int rc = hkdf_sha256(root, SPT_ROOT_LEN, info, off, key, SPT_KEY_LEN);
+    OPENSSL_cleanse(info, sizeof(info));
+    return rc;
+}
+
+int spt_mac_sign(const uint8_t key[SPT_KEY_LEN],
+                 const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                 const uint8_t *data,
+                 size_t data_len,
+                 uint8_t tag[SPT_TAG_LEN])
+{
+    if (!key || !aad || !tag || (data_len > 0 && !data) || data_len > SPT_MAX_PLAIN)
+        return -1;
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *ctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+    char digest[] = "SHA256";
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_end()
+    };
+    uint8_t full[32];
+    memset(full, 0, sizeof(full));
+    size_t outl = 0;
+    int rc = -1;
+    if (!ctx)
+        goto done;
+    if (EVP_MAC_init(ctx, key, SPT_KEY_LEN, params) != 1)
+        goto done;
+    if (EVP_MAC_update(ctx, aad, SPT_FRAME_HEADER_LEN) != 1)
+        goto done;
+    if (data_len > 0 && EVP_MAC_update(ctx, data, data_len) != 1)
+        goto done;
+    if (EVP_MAC_final(ctx, full, &outl, sizeof(full)) != 1 || outl != sizeof(full))
+        goto done;
+    memcpy(tag, full, SPT_TAG_LEN);
+    rc = 0;
+done:
+    EVP_MAC_CTX_free(ctx);
+    EVP_MAC_free(mac);
+    OPENSSL_cleanse(full, sizeof(full));
+    return rc;
+}
+
+int spt_mac_verify(const uint8_t key[SPT_KEY_LEN],
+                   const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                   const uint8_t *data,
+                   size_t data_len,
+                   const uint8_t tag[SPT_TAG_LEN])
+{
+    uint8_t expect[SPT_TAG_LEN];
+    if (!tag || spt_mac_sign(key, aad, data, data_len, expect) != 0)
+        return -1;
+    int diff = CRYPTO_memcmp(expect, tag, SPT_TAG_LEN);
+    OPENSSL_cleanse(expect, sizeof(expect));
+    return diff == 0 ? 0 : -1;
 }
 
 int spt_aead_seal(uint16_t alg,

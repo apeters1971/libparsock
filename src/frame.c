@@ -23,6 +23,7 @@ int spt_header_encode(uint8_t out[SPT_FRAME_HEADER_LEN], const struct spt_header
     ps_put_u64(out + 16, hdr->record_sequence);
     ps_put_u64(out + 24, hdr->logical_offset);
     ps_put_u32(out + 32, hdr->plaintext_length);
+    out[36] = hdr->protection;
     return 0;
 }
 
@@ -34,11 +35,14 @@ int spt_header_decode(const uint8_t in[SPT_FRAME_HEADER_LEN], struct spt_header 
         return -1;
     if (in[4] != SPT_VERSION)
         return -1;
-    if (ps_get_u32(in + 36) != 0)
+    if (in[36] != SPT_PROTECTION_CONFIDENTIAL && in[36] != SPT_PROTECTION_AUTHENTICATED)
+        return -1;
+    if (in[37] != 0 || in[38] != 0 || in[39] != 0)
         return -1;
     memset(hdr, 0, sizeof(*hdr));
     hdr->version = in[4];
     hdr->type = in[5];
+    hdr->protection = in[36];
     hdr->flags = ps_get_u16(in + 6);
     hdr->subflow_id = ps_get_u32(in + 8);
     hdr->key_generation = ps_get_u32(in + 12);

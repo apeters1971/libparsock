@@ -80,6 +80,7 @@ struct plain_slot {
 
 struct crypto_job {
     int op_open;
+    int mac;
     uint16_t alg;
     uint8_t key[SPT_KEY_LEN];
     uint8_t iv[SPT_IV_LEN];
@@ -103,6 +104,8 @@ struct gen_mat {
     uint8_t send_iv[SPT_IV_LEN];
     uint8_t recv_key[SPT_KEY_LEN];
     uint8_t recv_iv[SPT_IV_LEN];
+    uint8_t send_mac[SPT_KEY_LEN];
+    uint8_t recv_mac[SPT_KEY_LEN];
 };
 
 struct subflow {
@@ -192,6 +195,10 @@ struct ps_session {
     size_t max_poller_bytes;
     unsigned max_poller_records;
     uint16_t aead;
+    uint8_t min_protection;
+    uint8_t peer_min;
+    int have_peer_protection;
+    int protection_sent;
     uint32_t connect_timeout_ms;
     uint32_t io_timeout_ms;
     uint16_t data_port;
@@ -254,8 +261,10 @@ static int queue_ctrl_locked(struct ps_session *s, uint16_t type,
 static void refresh_write_locked(struct ps_session *s, struct subflow *sf);
 static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
                                  uint8_t type, uint16_t flags, uint64_t logical,
-                                 const uint8_t *plain, uint32_t plain_len);
+                                 const uint8_t *plain, uint32_t plain_len,
+                                 uint8_t protection);
 static void send_eos_locked(struct ps_session *s);
+static void send_protection_locked(struct ps_session *s);
 
 static void lock_s(struct ps_session *s) { pthread_mutex_lock(&s->mu); }
 static void unlock_s(struct ps_session *s) { pthread_mutex_unlock(&s->mu); }
@@ -476,6 +485,14 @@ static struct gen_mat *alloc_gen(struct ps_session *s, struct subflow *sf, uint3
                             sf->client_nonce, sf->server_nonce, s->session_id,
                             g->recv_key, g->recv_iv) != 0)
         return NULL;
+    if (spt_derive_mac_key(s->root, send_dir, sf->id, generation, SPT_MAC_HMAC_SHA256,
+                           sf->client_nonce, sf->server_nonce, s->session_id,
+                           g->send_mac) != 0)
+        return NULL;
+    if (spt_derive_mac_key(s->root, recv_dir, sf->id, generation, SPT_MAC_HMAC_SHA256,
+                           sf->client_nonce, sf->server_nonce, s->session_id,
+                           g->recv_mac) != 0)
+        return NULL;
     g->valid = 1;
     return g;
 }
@@ -531,12 +548,25 @@ static void free_job(struct crypto_job *job)
 
 static int execute_job(struct crypto_job *job)
 {
+    const uint8_t *in = job->in_len ? job->in : NULL;
+    if (job->mac) {
+        if (job->op_open) {
+            if (spt_mac_verify(job->key, job->aad, in, job->in_len, job->tag) != 0)
+                return -1;
+            if (job->in_len && job->out)
+                memcpy(job->out, in, job->in_len);
+            return 0;
+        }
+        if (job->in_len && job->out)
+            memcpy(job->out, in, job->in_len);
+        return spt_mac_sign(job->key, job->aad, in, job->in_len, job->tag);
+    }
     if (job->op_open) {
         return spt_aead_open(job->alg, job->key, job->iv, job->seq, job->aad,
-                             job->in_len ? job->in : NULL, job->in_len, job->tag, job->out);
+                             in, job->in_len, job->tag, job->out);
     }
     return spt_aead_seal(job->alg, job->key, job->iv, job->seq, job->aad,
-                         job->in_len ? job->in : NULL, job->in_len, job->out, job->tag);
+                         in, job->in_len, job->out, job->tag);
 }
 
 static void submit_job_locked(struct ps_session *s, struct crypto_job *job)
@@ -621,10 +651,20 @@ static void *worker_main(void *arg)
 
 static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
                                  uint8_t type, uint16_t flags, uint64_t logical,
-                                 const uint8_t *plain, uint32_t plain_len)
+                                 const uint8_t *plain, uint32_t plain_len,
+                                 uint8_t protection)
 {
     if (sf->send_seq >= SPT_REKEY_RECORD_LIMIT) {
         fail_locked(s, PS_ERR_LIMIT);
+        return -1;
+    }
+    if (protection != SPT_PROTECTION_CONFIDENTIAL &&
+        protection != SPT_PROTECTION_AUTHENTICATED) {
+        fail_locked(s, PS_ERR_PROTO);
+        return -1;
+    }
+    if (type != SPT_REC_DATA && protection != SPT_PROTECTION_CONFIDENTIAL) {
+        fail_locked(s, PS_ERR_PROTO);
         return -1;
     }
     struct gen_mat *g = gen_lookup(sf, sf->send_gen);
@@ -636,6 +676,7 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     memset(&hdr, 0, sizeof(hdr));
     hdr.version = SPT_VERSION;
     hdr.type = type;
+    hdr.protection = protection;
     hdr.flags = flags;
     hdr.subflow_id = sf->id;
     hdr.key_generation = sf->send_gen;
@@ -665,9 +706,14 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     sf->out_tail = slot;
     sf->out_bytes += wire;
     job->op_open = 0;
+    job->mac = protection == SPT_PROTECTION_AUTHENTICATED;
     job->alg = s->aead;
-    memcpy(job->key, g->send_key, SPT_KEY_LEN);
-    memcpy(job->iv, g->send_iv, SPT_IV_LEN);
+    if (job->mac)
+        memcpy(job->key, g->send_mac, SPT_KEY_LEN);
+    else {
+        memcpy(job->key, g->send_key, SPT_KEY_LEN);
+        memcpy(job->iv, g->send_iv, SPT_IV_LEN);
+    }
     job->seq = sf->send_seq;
     memcpy(job->aad, frame, SPT_FRAME_HEADER_LEN);
     if (plain_len) {
@@ -725,7 +771,8 @@ static void try_end_locked(struct ps_session *s, struct subflow *sf)
         return;
     if (sf->out_head || sf->preface_off < sf->preface_len)
         return;
-    if (enqueue_record_locked(s, sf, SPT_REC_SUBFLOW_END, 0, 0, NULL, 0) != 0)
+    if (enqueue_record_locked(s, sf, SPT_REC_SUBFLOW_END, 0, 0, NULL, 0,
+                              SPT_PROTECTION_CONFIDENTIAL) != 0)
         return;
     sf->end_sent = 1;
 }
@@ -802,6 +849,14 @@ static void apply_slot_locked(struct ps_session *s, struct subflow *sf, struct p
         fail_locked(s, PS_ERR_PROTO);
         return;
     }
+    if (h->type != SPT_REC_DATA && h->protection != SPT_PROTECTION_CONFIDENTIAL) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
+    if (!spt_protection_accepts(s->min_protection, h->protection)) {
+        fail_locked(s, PS_ERR_PROTO);
+        return;
+    }
     if (sf->recv_gen == 0 && h->record_sequence == 0 && h->key_generation == 0) {
         uint8_t expect = s->is_server ? SPT_REC_JOIN : SPT_REC_JOIN_ACK;
         if (h->type != expect || h->plaintext_length != SPT_JOIN_PLAIN_LEN) {
@@ -830,7 +885,8 @@ static void apply_slot_locked(struct ps_session *s, struct subflow *sf, struct p
                 fail_locked(s, PS_ERR_PROTO);
                 return;
             }
-            if (enqueue_record_locked(s, sf, SPT_REC_JOIN_ACK, 0, 0, raw, SPT_JOIN_PLAIN_LEN) != 0)
+            if (enqueue_record_locked(s, sf, SPT_REC_JOIN_ACK, 0, 0, raw, SPT_JOIN_PLAIN_LEN,
+                                      SPT_PROTECTION_CONFIDENTIAL) != 0)
                 return;
             mark_active_locked(s, sf);
             return;
@@ -1004,9 +1060,14 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
         sf->in_tail = slot;
         sf->in_flight++;
         job->op_open = 1;
+        job->mac = hdr.protection == SPT_PROTECTION_AUTHENTICATED;
         job->alg = s->aead;
-        memcpy(job->key, g->recv_key, SPT_KEY_LEN);
-        memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
+        if (job->mac)
+            memcpy(job->key, g->recv_mac, SPT_KEY_LEN);
+        else {
+            memcpy(job->key, g->recv_key, SPT_KEY_LEN);
+            memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
+        }
         job->seq = hdr.record_sequence;
         memcpy(job->aad, sf->rx, 0); /* aad copied below from saved header bytes */
         spt_header_encode(job->aad, &hdr);
@@ -1037,7 +1098,8 @@ static void send_eos_locked(struct ps_session *s)
         s->eos_pending = 1;
         return;
     }
-    if (enqueue_record_locked(s, sf, SPT_REC_EOS, SPT_FF_FIN, s->send_off, NULL, 0) != 0)
+    if (enqueue_record_locked(s, sf, SPT_REC_EOS, SPT_FF_FIN, s->send_off, NULL, 0,
+                              SPT_PROTECTION_CONFIDENTIAL) != 0)
         return;
     s->send_fin = 1;
     s->eos_pending = 0;
@@ -1207,7 +1269,8 @@ static void handle_client_hello_locked(struct ps_session *s, const uint8_t *body
         fail_locked(s, PS_ERR_PROTO);
         return;
     }
-    if (ch.aead != SPT_AEAD_AES_256_GCM && ch.aead != SPT_AEAD_CHACHA20_POLY1305) {
+    if (ch.aead != SPT_AEAD_AES_256_GCM && ch.aead != SPT_AEAD_CHACHA20_POLY1305 &&
+        ch.aead != SPT_AEAD_AES_128_GCM) {
         fail_locked(s, PS_ERR_PROTO);
         return;
     }
@@ -1266,6 +1329,7 @@ static void handle_client_hello_locked(struct ps_session *s, const uint8_t *body
     s->advertised = s->recv_window;
     become_negotiated_export(s);
     queue_ctrl_locked(s, SPT_CTRL_SERVER_HELLO, s->server_hello, SPT_SERVER_HELLO_LEN);
+    send_protection_locked(s);
     ps_log("server hello queued port=%u sockets=%u", s->data_port, want);
     if (!s->registered) {
         s->registered = 1;
@@ -1478,10 +1542,46 @@ static void handle_ctrl_locked(struct ps_session *s, uint16_t type, const uint8_
         on_rekey_locked(s, ps_get_u32(body), ps_get_u32(body + 4),
                         type == SPT_CTRL_KEY_UPDATE_ACK);
         break;
+    case SPT_CTRL_PROTECTION: {
+        if (len != 4 || body[2] != 0 || body[3] != 0) {
+            fail_locked(s, PS_ERR_PROTO);
+            break;
+        }
+        uint8_t minp = body[0];
+        uint8_t mac = body[1];
+        if ((minp != SPT_PROTECTION_CONFIDENTIAL && minp != SPT_PROTECTION_AUTHENTICATED) ||
+            mac != SPT_MAC_HMAC_SHA256) {
+            fail_locked(s, PS_ERR_PROTO);
+            break;
+        }
+        if (s->have_peer_protection) {
+            if (s->peer_min != minp)
+                fail_locked(s, PS_ERR_PROTO);
+            break;
+        }
+        s->peer_min = minp;
+        s->have_peer_protection = 1;
+        pthread_cond_broadcast(&s->cv);
+        break;
+    }
     default:
         fail_locked(s, PS_ERR_PROTO);
         break;
     }
+}
+
+static void send_protection_locked(struct ps_session *s)
+{
+    if (s->protection_sent || s->state == PS_STATE_FAILED)
+        return;
+    uint8_t body[4];
+    body[0] = s->min_protection;
+    body[1] = SPT_MAC_HMAC_SHA256;
+    body[2] = 0;
+    body[3] = 0;
+    if (queue_ctrl_locked(s, SPT_CTRL_PROTECTION, body, 4) != 0)
+        return;
+    s->protection_sent = 1;
 }
 
 static void client_begin(struct ps_session *s)
@@ -1545,6 +1645,7 @@ static void client_begin(struct ps_session *s)
     s->have_client_hello = 1;
     s->advertised = s->recv_window;
     queue_ctrl_locked(s, SPT_CTRL_CLIENT_HELLO, s->client_hello, SPT_CLIENT_HELLO_LEN);
+    send_protection_locked(s);
     ps_log("client hello queued sockets=%u", s->proposed);
     unlock_s(s);
 }
@@ -1569,7 +1670,8 @@ static struct subflow *pick_sf(struct ps_session *s)
     return NULL;
 }
 
-static size_t submit_locked(struct ps_session *s, const uint8_t *buf, size_t len, int *err)
+static size_t submit_locked(struct ps_session *s, const uint8_t *buf, size_t len,
+                            uint8_t protection, int *err)
 {
     size_t acc = 0;
     *err = PS_OK;
@@ -1608,8 +1710,26 @@ static size_t submit_locked(struct ps_session *s, const uint8_t *buf, size_t len
             *err = PS_ERR_AGAIN;
             break;
         }
+        if (protection == SPT_PROTECTION_AUTHENTICATED) {
+            if (s->min_protection != SPT_PROTECTION_AUTHENTICATED) {
+                *err = PS_ERR_AUTH;
+                break;
+            }
+            if (!s->have_peer_protection) {
+                *err = PS_ERR_AGAIN;
+                s->send_stalled = 1;
+                break;
+            }
+            if (s->peer_min != SPT_PROTECTION_AUTHENTICATED) {
+                *err = PS_ERR_AUTH;
+                break;
+            }
+        } else if (protection != SPT_PROTECTION_CONFIDENTIAL) {
+            *err = PS_ERR_INVAL;
+            break;
+        }
         if (enqueue_record_locked(s, sf, SPT_REC_DATA, 0, s->send_off, buf + acc,
-                                  (uint32_t)chunk) != 0) {
+                                  (uint32_t)chunk, protection) != 0) {
             *err = s->err ? s->err : PS_ERR_NOMEM;
             break;
         }
@@ -1755,6 +1875,8 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
         o.receive_window = o.frame_size;
     if (o.aead == 0)
         o.aead = PS_AEAD_AES_256_GCM;
+    if (o.min_protection != PS_PROTECTION_AUTHENTICATED)
+        o.min_protection = PS_PROTECTION_CONFIDENTIAL;
     if (o.scale_interval_ms == 0)
         o.scale_interval_ms = d.scale_interval_ms;
     if (o.min_transfer_size == 0)
@@ -1782,6 +1904,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
     s->max_poller_bytes = o.max_poller_bytes;
     s->max_poller_records = o.max_poller_records;
     s->aead = (uint16_t)o.aead;
+    s->min_protection = (uint8_t)o.min_protection;
     s->connect_timeout_ms = o.connect_timeout_ms;
     s->io_timeout_ms = o.io_timeout_ms;
     s->advertised = s->recv_window;
@@ -2384,7 +2507,8 @@ int ps_session_on_connected(ps_session_t *session, int fd)
             memcpy(join.hello_hash, session->hello_hash, SPT_HASH_LEN);
             uint8_t raw[SPT_JOIN_PLAIN_LEN];
             spt_join_encode(raw, &join);
-            enqueue_record_locked(session, sf, SPT_REC_JOIN, 0, 0, raw, SPT_JOIN_PLAIN_LEN);
+            enqueue_record_locked(session, sf, SPT_REC_JOIN, 0, 0, raw, SPT_JOIN_PLAIN_LEN,
+                                  SPT_PROTECTION_CONFIDENTIAL);
         }
     }
     refresh_write_locked(session, sf);
@@ -2544,7 +2668,7 @@ int ps_session_wait_open(ps_session_t *session, uint32_t timeout_ms)
 }
 
 ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
-                             uint32_t timeout_ms)
+                             uint8_t protection, uint32_t timeout_ms)
 {
     if (!session || (!buf && len))
         return -1;
@@ -2560,7 +2684,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
     while (left) {
         lock_s(session);
         int err = PS_OK;
-        size_t n = submit_locked(session, p, left, &err);
+        size_t n = submit_locked(session, p, left, protection, &err);
         int failed = session->state == PS_STATE_FAILED;
         if (failed)
             fatal = session->err ? session->err : PS_ERR_PROTO;
@@ -2577,7 +2701,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
         }
         lock_s(session);
         err = PS_OK;
-        n = submit_locked(session, p, left, &err);
+        n = submit_locked(session, p, left, protection, &err);
         if (n == 0 && err == PS_ERR_AGAIN && session->state != PS_STATE_FAILED) {
             int rc = 0;
             if (use_deadline)
@@ -2599,9 +2723,11 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
     }
     ps_session_progress(session);
     if (left == len && fatal) {
-        lock_s(session);
-        session->err = fatal;
-        unlock_s(session);
+        if (fatal != PS_ERR_AUTH && fatal != PS_ERR_INVAL) {
+            lock_s(session);
+            session->err = fatal;
+            unlock_s(session);
+        }
         return -1;
     }
     return (ssize_t)(len - left);
@@ -2882,7 +3008,27 @@ int ps_submit_send(ps_session_t *session, const void *data, size_t length, size_
         return -PS_ERR_INVAL;
     lock_s(session);
     int err = PS_OK;
-    size_t n = submit_locked(session, (const uint8_t *)data, length, &err);
+    size_t n = submit_locked(session, (const uint8_t *)data, length,
+                             SPT_PROTECTION_CONFIDENTIAL, &err);
+    *accepted = n;
+    if (session->state == PS_STATE_FAILED)
+        err = session->err ? session->err : PS_ERR_PROTO;
+    unlock_s(session);
+    ps_session_progress(session);
+    if (n > 0)
+        return PS_OK;
+    return err ? -err : -PS_ERR_AGAIN;
+}
+
+int ps_submit_send_protected(ps_session_t *session, const struct ps_send_descriptor *desc,
+                             size_t *accepted)
+{
+    if (!session || !desc || !accepted || (!desc->buffer && desc->length))
+        return -PS_ERR_INVAL;
+    lock_s(session);
+    int err = PS_OK;
+    size_t n = submit_locked(session, (const uint8_t *)desc->buffer, desc->length,
+                             (uint8_t)desc->protection, &err);
     *accepted = n;
     if (session->state == PS_STATE_FAILED)
         err = session->err ? session->err : PS_ERR_PROTO;

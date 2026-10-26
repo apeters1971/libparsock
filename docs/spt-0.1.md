@@ -40,6 +40,7 @@ The on-wire size is `8 + body`. The maximum body is 65532 bytes. A peer that doe
 | 11 | SCALE_REQUEST | 4: desired socket count |
 | 12 | KEY_UPDATE | 8: subflow id, generation |
 | 13 | KEY_UPDATE_ACK | 8: subflow id, generation |
+| 14 | PROTECTION | 4: minimum profile, MAC id, reserved `u16` = 0 |
 
 ### CLIENT_HELLO
 
@@ -123,6 +124,9 @@ AEAD ids:
 |---:|---|
 | 1 | AES-256-GCM |
 | 2 | ChaCha20-Poly1305 |
+| 3 | AES-128-GCM |
+
+AES-128-GCM uses the first 16 bytes of the 32-byte HKDF output. The AEAD id in the info string keeps that key distinct from AES-256-GCM. A server whose configured AEAD is non-zero rejects a different client AEAD, including AES-128-GCM.
 
 The authentication tag is 16 bytes. The nonce is 12 bytes:
 
@@ -150,7 +154,7 @@ The client nonce is not in the preface. It is inside the encrypted `JOIN`. The s
 
 ## Records
 
-A record is a 40-byte header, ciphertext of the plaintext, and a 16-byte tag. The header is AEAD associated data. The maximum plaintext is 256 KiB. The default plaintext size is 64 KiB.
+A record is a 40-byte header, a payload, and a 16-byte tag. The header is authenticated. The maximum plaintext is 256 KiB. The default plaintext size is 64 KiB. The default profile is confidential: the payload is AEAD ciphertext. An authenticated profile carries plaintext plus an HMAC-SHA-256 tag truncated to 16 bytes, and only when both peers have authorized it.
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -163,9 +167,30 @@ A record is a 40-byte header, ciphertext of the plaintext, and a 16-byte tag. Th
 | 16 | 8 | record sequence |
 | 24 | 8 | logical offset |
 | 32 | 4 | plaintext length |
-| 36 | 4 | reserved, must be 0 |
+| 36 | 1 | protection profile |
+| 37 | 3 | reserved, must be 0 |
 
 Unknown flag bits are rejected. The only defined flag is `FIN` (`0x0001`).
+
+Protection profiles:
+
+| Value | Name | Payload |
+|---:|---|---|
+| 0 | confidential | AEAD ciphertext. This is the default, and byte 36 stays 0. |
+| 1 | authenticated | plaintext. Tag is HMAC-SHA-256 over the 40-byte header and the payload, truncated to 16 bytes. |
+
+Any other profile value is rejected before the payload is delivered. `JOIN`, `JOIN_ACK`, `SUBFLOW_END`, and `EOS` are confidential. Only `DATA` may be authenticated. The receiver drops a record whose profile is weaker than its configured minimum. Confidential is stronger than authenticated, so a confidential record is always acceptable to a peer that has authorized authentication-only data.
+
+Both peers send `PROTECTION` on the TLS control connection immediately after their hello. The body is `u8 minimum`, `u8 mac_alg` (`1` = HMAC-SHA-256), `u16` reserved 0. A peer's message records the floor it will accept. It does not lower the local floor. Sending authenticated data requires the local minimum and the peer minimum to both be authenticated. If the peer message has not arrived yet, the send waits. A second message with a different minimum is a protocol error.
+
+MAC keys are HKDF-SHA256 from the same root and salt, with info:
+
+```text
+"spt-mac-v1" (10) || u8 direction || u32 subflow_id || u32 generation
+    || u16 mac_alg || client_nonce (32) || server_nonce (32) || session_id (32)
+```
+
+The output is 32 bytes and is not interchangeable with an AEAD key. The MAC input is the canonical 40-byte header followed by the plaintext. There is no nonce. Replay protection is the authenticated record sequence.
 
 | Type | Name | Rules |
 |---:|---|---|
@@ -223,5 +248,6 @@ An independent implementation has to reproduce:
 
 - header, control, preface, hello, and join codecs
 - HKDF-SHA256 output for the info string above, checked against HMAC-SHA256 rather than against this tree's `EVP_KDF` call
-- AES-256-GCM and ChaCha20-Poly1305 seals, including empty plaintext, and rejection of a modified tag
+- AES-256-GCM, AES-128-GCM, and ChaCha20-Poly1305 seals, including empty plaintext, and rejection of a modified tag
+- HMAC-SHA-256 MAC keys for prefix `spt-mac-v1`, truncated to 16 bytes, and rejection of a modified plaintext or profile byte
 - nonce `static_iv XOR encode96(sequence)`

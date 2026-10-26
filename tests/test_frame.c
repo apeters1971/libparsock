@@ -40,9 +40,25 @@ int main(void)
     raw[4] = 9;
     expect(spt_header_decode(raw, &back) != 0, "bad version");
     raw[4] = SPT_VERSION;
-    raw[36] = 1;
-    expect(spt_header_decode(raw, &back) != 0, "reserved");
+    expect(back.protection == SPT_PROTECTION_CONFIDENTIAL, "default profile");
+    raw[36] = SPT_PROTECTION_AUTHENTICATED;
+    expect(spt_header_decode(raw, &back) == 0, "authenticated profile");
+    expect(back.protection == SPT_PROTECTION_AUTHENTICATED, "profile field");
+    raw[37] = 1;
+    expect(spt_header_decode(raw, &back) != 0, "reserved tail");
+    raw[37] = 0;
+    raw[36] = 2;
+    expect(spt_header_decode(raw, &back) != 0, "unknown profile");
     raw[36] = 0;
+    expect(spt_protection_accepts(SPT_PROTECTION_CONFIDENTIAL, SPT_PROTECTION_CONFIDENTIAL),
+           "floor confidential");
+    expect(!spt_protection_accepts(SPT_PROTECTION_CONFIDENTIAL, SPT_PROTECTION_AUTHENTICATED),
+           "reject downgrade");
+    expect(spt_protection_accepts(SPT_PROTECTION_AUTHENTICATED, SPT_PROTECTION_CONFIDENTIAL),
+           "confidential exceeds floor");
+    expect(spt_protection_accepts(SPT_PROTECTION_AUTHENTICATED, SPT_PROTECTION_AUTHENTICATED),
+           "authenticated floor");
+    expect(!spt_protection_accepts(9, SPT_PROTECTION_CONFIDENTIAL), "unknown floor");
     hdr.plaintext_length = SPT_MAX_PLAIN + 1;
     expect(spt_header_encode(raw, &hdr) == 0, "encode oversize");
     expect(spt_header_decode(raw, &back) != 0, "reject oversize");

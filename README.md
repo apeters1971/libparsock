@@ -30,7 +30,8 @@ ctest --test-dir build-asan --output-on-failure
 
 - Fixed, automatic, and advisory socket counts
 - TLS 1.3 control plane via unmodified OpenSSL
-- AES-256-GCM and ChaCha20-Poly1305 data records
+- AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 data records
+- Optional authentication-only data records (HMAC-SHA-256) when both peers set `min_protection` to authenticated. `ps_send` stays confidential. `ps_send_protected` selects the profile for one buffer. The library copies that buffer.
 - Ordered reassembly, absolute receive windows, and a generation-based rekey
 - A blocking `ps_connect` / `ps_send` / `ps_recv` API
 - An embedded readiness API (`ps_on_readable`, `ps_on_writable`, `ps_embed_service`) for an external poller
@@ -61,7 +62,14 @@ One HTTP/1.1 GET of a generated body, with no Range requests:
 ./build/spt_http client cert.pem key.pem 127.0.0.1 <port> 1048576
 ```
 
-Set the same `ps_options.aead` on both peers. A ChaCha20 client is rejected by an AES-256-GCM server.
+Set the same `ps_options.aead` on both peers. A ChaCha20 or AES-128-GCM client is rejected by an AES-256-GCM server.
+
+To carry a public response body without payload encryption, both processes pass `public` and the server marks only that body authenticated. The request and response headers stay confidential:
+
+```sh
+./build/spt_http server cert.pem key.pem 0 public
+./build/spt_http client cert.pem key.pem 127.0.0.1 <port> 1048576 public
+```
 
 ## Layout
 
