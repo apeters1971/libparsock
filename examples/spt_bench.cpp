@@ -36,7 +36,7 @@
 
 namespace {
 
-constexpr std::size_t kChunk = 1024 * 1024;
+constexpr std::size_t kChunk = 2 * 1024 * 1024;
 constexpr std::size_t kFrame = 256 * 1024;
 constexpr std::uint64_t kUntilEof = UINT64_MAX;
 constexpr std::uint8_t kFlagPattern = 1;

@@ -113,6 +113,7 @@ struct crypto_job {
     int aead_owned;
     int aead_slot;
     int keep_in;
+    int user_ref;
 };
 
 struct gen_mat {
@@ -157,6 +158,7 @@ struct subflow {
     struct wire_slot *out_head;
     struct wire_slot *out_tail;
     size_t out_bytes;
+    int tx_full;
     uint8_t preface[SPT_PREFACE_LEN];
     size_t preface_len;
     size_t preface_off;
@@ -263,6 +265,7 @@ struct ps_session {
     struct crypto_job *job_head;
     struct crypto_job *job_tail;
     unsigned jobs_inflight;
+    unsigned user_tx_inflight;
     ps_io_cbs io;
     struct ps_session_hooks hooks;
     struct ps_scale_state scale;
@@ -620,9 +623,20 @@ static void free_job(struct crypto_job *job)
 
 static int execute_job(struct crypto_job *job)
 {
-    const uint8_t *in = job->in_len ? job->in : NULL;
     if (!job->aead_ctx)
         return -1;
+    if (!job->op_open && job->copy_src && job->in_len) {
+        const uint8_t *src = job->copy_src;
+        job->copy_src = NULL;
+        if (job->mac) {
+            memcpy(job->out, src, job->in_len);
+            return spt_aead_seal_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                                     job->out, job->in_len, NULL, job->tag);
+        }
+        return spt_aead_seal_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                                 src, job->in_len, job->out, job->tag);
+    }
+    const uint8_t *in = job->in_len ? job->in : NULL;
     if (job->mac) {
         if (job->op_open) {
             return spt_aead_open_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
@@ -674,10 +688,20 @@ static void submit_job_locked(struct ps_session *s, struct crypto_job *job)
     submit_batch_locked(s, job, job, 1);
 }
 
+static void release_user_ref_locked(struct ps_session *s, struct crypto_job *job)
+{
+    if (job && job->user_ref) {
+        job->user_ref = 0;
+        if (s->user_tx_inflight > 0 && --s->user_tx_inflight == 0)
+            pthread_cond_broadcast(&s->cv);
+    }
+}
+
 static void finish_job_locked(struct ps_session *s, struct crypto_job *job, int ok)
 {
     if (s->jobs_inflight)
         s->jobs_inflight--;
+    release_user_ref_locked(s, job);
     if (job->op_open) {
         if (job->pslot) {
             job->pslot->ready = 1;
@@ -856,6 +880,8 @@ static int enqueue_record_batch_locked(struct ps_session *s, struct subflow *sf,
     }
     sf->send_seq++;
     if (batch_head) {
+        job->user_ref = 1;
+        s->user_tx_inflight++;
         s->jobs_inflight++;
         job->next = NULL;
         if (*batch_tail)
@@ -1884,7 +1910,11 @@ static struct subflow *pick_sf(struct ps_session *s)
         struct subflow *sf = &s->sf[i];
         if (!sf->used || sf->state != SF_ACTIVE || sf->drain || !sf->keys_ready)
             continue;
-        if (sf->out_bytes + need > s->sf_hi)
+        if (sf->out_bytes + need > s->sf_hi) {
+            sf->tx_full = 1;
+            continue;
+        }
+        if (sf->tx_full)
             continue;
         if (sf->send_seq >= SPT_REKEY_RECORD_LIMIT)
             continue;
@@ -1901,7 +1931,7 @@ static struct subflow *pick_sf(struct ps_session *s)
 }
 
 static size_t submit_locked(struct ps_session *s, const uint8_t *buf, size_t len,
-                            uint8_t protection, int *err)
+                            uint8_t protection, int defer_copy, int *err)
 {
     size_t acc = 0;
     *err = PS_OK;
@@ -1973,19 +2003,23 @@ static size_t submit_locked(struct ps_session *s, const uint8_t *buf, size_t len
         s->send_stalled = 0;
     }
     if (batch_head) {
-        s->send_hold++;
-        unlock_s(s);
-        for (struct crypto_job *j = batch_head; j; j = j->next) {
-            if (j->copy_src && j->in_len) {
-                memcpy(j->in, j->copy_src, j->in_len);
-                j->copy_src = NULL;
+        if (!defer_copy) {
+            s->send_hold++;
+            unlock_s(s);
+            for (struct crypto_job *j = batch_head; j; j = j->next) {
+                if (j->copy_src && j->in_len) {
+                    memcpy(j->in, j->copy_src, j->in_len);
+                    j->copy_src = NULL;
+                }
             }
+            lock_s(s);
+            for (struct crypto_job *j = batch_head; j; j = j->next)
+                release_user_ref_locked(s, j);
+            if (s->send_hold)
+                s->send_hold--;
+            if (s->closing || s->state == PS_STATE_CLOSED)
+                pthread_cond_broadcast(&s->cv);
         }
-        lock_s(s);
-        if (s->send_hold)
-            s->send_hold--;
-        if (s->closing || s->state == PS_STATE_CLOSED)
-            pthread_cond_broadcast(&s->cv);
         submit_batch_locked(s, batch_head, batch_tail, batch_count);
     }
     return acc;
@@ -2021,6 +2055,9 @@ static void run_ready_work(struct ps_session *s, int limit)
         ran = 1;
         if (failed) {
             lock_s(s);
+            if (s->jobs_inflight)
+                s->jobs_inflight--;
+            release_user_ref_locked(s, job);
             free_job(job);
             unlock_s(s);
             continue;
@@ -2838,7 +2875,9 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
                 freed = 1;
             }
         }
-        if (freed && session->send_stalled)
+        if (sf->tx_full && sf->out_bytes <= (session->sf_hi * 3) / 4)
+            sf->tx_full = 0;
+        if (freed && !sf->tx_full && session->send_stalled)
             pthread_cond_broadcast(&session->cv);
         if (session->send_hold)
             session->send_hold--;
@@ -3045,6 +3084,52 @@ int ps_session_wait_open(ps_session_t *session, uint32_t timeout_ms)
     return err ? -err : PS_OK;
 }
 
+static int step_worker_job(struct ps_session *s)
+{
+    if (s->nworkers == 0 || s->workers_stopped) {
+        run_ready_work(s, 1);
+        return 0;
+    }
+    pthread_mutex_lock(&s->job_mu);
+    struct crypto_job *job = s->job_head;
+    if (job) {
+        s->job_head = job->next;
+        if (!s->job_head)
+            s->job_tail = NULL;
+    }
+    pthread_mutex_unlock(&s->job_mu);
+    if (!job)
+        return 0;
+    int ok = execute_job(job);
+    int opened = job->op_open;
+    lock_s(s);
+    finish_job_locked(s, job, ok);
+    if (opened && s->state != PS_STATE_FAILED)
+        apply_sf_locked(s, job->sf);
+    release_aead(job);
+    int need_dispatch = s->nacts > 0 || s->poke_pending;
+    unlock_s(s);
+    free_job(job);
+    if (need_dispatch)
+        dispatch(s);
+    return 1;
+}
+
+static void drain_user_tx(struct ps_session *s)
+{
+    if (s->nworkers == 0 || s->workers_stopped) {
+        run_ready_work(s, -1);
+        dispatch(s);
+    } else {
+        while (step_worker_job(s)) {
+        }
+    }
+    lock_s(s);
+    while (s->user_tx_inflight > 0)
+        pthread_cond_wait(&s->cv, &s->mu);
+    unlock_s(s);
+}
+
 ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
                              uint8_t protection, uint32_t timeout_ms)
 {
@@ -3053,6 +3138,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
     const uint8_t *p = (const uint8_t *)buf;
     size_t left = len;
     int fatal = PS_OK;
+    int defer = protection == SPT_PROTECTION_CONFIDENTIAL;
     struct timespec ts;
     int use_deadline = timeout_ms != UINT32_MAX;
     if (use_deadline) {
@@ -3062,7 +3148,7 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
     while (left) {
         lock_s(session);
         int err = PS_OK;
-        size_t n = submit_locked(session, p, left, protection, &err);
+        size_t n = submit_locked(session, p, left, protection, defer, &err);
         int failed = session->state == PS_STATE_FAILED;
         if (failed)
             fatal = session->err ? session->err : PS_ERR_PROTO;
@@ -3072,14 +3158,17 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
             left -= n;
             continue;
         }
-        ps_session_progress_step(session);
+        if (defer)
+            drain_user_tx(session);
+        else if (ps_session_inline_pending(session))
+            ps_session_progress_step(session);
         if (failed || (err != PS_ERR_AGAIN && err != PS_OK)) {
             fatal = fatal ? fatal : err;
             break;
         }
         lock_s(session);
         err = PS_OK;
-        n = submit_locked(session, p, left, protection, &err);
+        n = submit_locked(session, p, left, protection, defer, &err);
         if (n == 0 && err == PS_ERR_AGAIN && session->state != PS_STATE_FAILED) {
             int rc = 0;
             if (use_deadline)
@@ -3099,7 +3188,10 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
             left -= n;
         }
     }
-    ps_session_progress_step(session);
+    if (defer)
+        drain_user_tx(session);
+    else if (ps_session_inline_pending(session))
+        ps_session_progress_step(session);
     if (left == len && fatal) {
         if (fatal != PS_ERR_AUTH && fatal != PS_ERR_INVAL) {
             lock_s(session);
@@ -3444,7 +3536,7 @@ int ps_submit_send(ps_session_t *session, const void *data, size_t length, size_
     lock_s(session);
     int err = PS_OK;
     size_t n = submit_locked(session, (const uint8_t *)data, length,
-                             SPT_PROTECTION_CONFIDENTIAL, &err);
+                             SPT_PROTECTION_CONFIDENTIAL, 0, &err);
     *accepted = n;
     if (session->state == PS_STATE_FAILED)
         err = session->err ? session->err : PS_ERR_PROTO;
@@ -3463,7 +3555,7 @@ int ps_submit_send_protected(ps_session_t *session, const struct ps_send_descrip
     lock_s(session);
     int err = PS_OK;
     size_t n = submit_locked(session, (const uint8_t *)desc->buffer, desc->length,
-                             (uint8_t)desc->protection, &err);
+                             (uint8_t)desc->protection, 0, &err);
     *accepted = n;
     if (session->state == PS_STATE_FAILED)
         err = session->err ? session->err : PS_ERR_PROTO;
