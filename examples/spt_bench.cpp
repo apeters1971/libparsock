@@ -37,6 +37,7 @@
 namespace {
 
 constexpr std::size_t kChunk = 256 * 1024;
+constexpr std::size_t kFrame = 256 * 1024;
 constexpr std::uint64_t kUntilEof = UINT64_MAX;
 constexpr std::uint8_t kFlagPattern = 1;
 constexpr char kMagic[4] = {'S', 'P', 'T', 'B'};
@@ -505,7 +506,7 @@ parsock::options make_options(const config &cfg, const std::string &server_name,
         .workers(cfg.workers)
         .cipher(cfg.cipher)
         .minimum_protection(cfg.protection)
-        .frame_size(65536)
+        .frame_size(kFrame)
         .receive_window(64ull << 20)
         .connect_timeout(10000)
         .io_timeout(300000);
@@ -530,9 +531,35 @@ std::uint64_t get_u64(const std::uint8_t *in)
     return value;
 }
 
-std::uint8_t pattern_byte(std::uint64_t offset)
+inline std::uint8_t pattern_byte(std::uint64_t offset)
 {
     return static_cast<std::uint8_t>((offset * 131u) ^ (offset >> 8));
+}
+
+void fill_pattern(std::uint8_t *dst, std::uint64_t offset, std::size_t n)
+{
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        dst[i] = pattern_byte(offset + i);
+        dst[i + 1] = pattern_byte(offset + i + 1);
+        dst[i + 2] = pattern_byte(offset + i + 2);
+        dst[i + 3] = pattern_byte(offset + i + 3);
+        dst[i + 4] = pattern_byte(offset + i + 4);
+        dst[i + 5] = pattern_byte(offset + i + 5);
+        dst[i + 6] = pattern_byte(offset + i + 6);
+        dst[i + 7] = pattern_byte(offset + i + 7);
+    }
+    for (; i < n; i++)
+        dst[i] = pattern_byte(offset + i);
+}
+
+bool pattern_matches(const std::uint8_t *src, std::uint64_t offset, std::size_t n)
+{
+    for (std::size_t i = 0; i < n; i++) {
+        if (src[i] != pattern_byte(offset + i))
+            return false;
+    }
+    return true;
 }
 
 class hasher {
@@ -657,8 +684,7 @@ void send_direction(parsock::connection &conn, const config &cfg, meter &stats, 
             if (from_file)
                 read_exact(file, reinterpret_cast<char *>(buf.data()), chunk, cfg.send_path);
             else {
-                for (std::size_t i = 0; i < chunk; i++)
-                    buf[i] = pattern_byte(sent + i);
+                fill_pattern(buf.data(), sent, chunk);
             }
             mark_start(stats.tx_start_ns);
             conn.send(buf.data(), chunk, cfg.protection);
@@ -712,12 +738,8 @@ void recv_direction(parsock::connection &conn, const config &cfg, meter &stats, 
                     throw std::runtime_error("stream ended before the announced length");
                 break;
             }
-            if (check_pattern) {
-                for (std::size_t i = 0; i < n; i++) {
-                    if (buf[i] != pattern_byte(got + i))
-                        throw std::runtime_error("payload mismatch");
-                }
-            }
+            if (check_pattern && !pattern_matches(buf.data(), got, n))
+                throw std::runtime_error("payload mismatch");
             if (!cfg.recv_path.empty()) {
                 file.write(reinterpret_cast<const char *>(buf.data()), static_cast<std::streamsize>(n));
                 if (!file)
@@ -851,8 +873,8 @@ struct chart {
         const std::uint64_t tx_expect = stats.tx_expect.load();
         const std::uint64_t rx_expect = stats.rx_expect.load();
         std::cout << title << "   " << aead_name(cfg.cipher) << "   " << protection_name(cfg.protection)
-                  << "   " << stats.sockets.load() << " sockets   RTT " << stats.rtt_us.load()
-                  << " us\033[K\n";
+                  << "   " << stats.sockets.load() << " sockets   frame " << (kFrame / 1024)
+                  << " KiB   RTT " << stats.rtt_us.load() << " us\033[K\n";
         std::cout << "tx   " << rate_text(history.empty() ? 0 : history.back().tx_gbps) << "   avg "
                   << rate_text(gbps_of(tx, stats.tx_start_ns.load(), now_ns())) << "   peak "
                   << rate_text(tx_peak) << "    " << bytes_text(tx);

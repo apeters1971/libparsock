@@ -162,6 +162,20 @@ int spt_derive_mac_key(const uint8_t root[SPT_ROOT_LEN],
     return rc;
 }
 
+static _Thread_local EVP_MAC *tl_hmac;
+static _Thread_local EVP_MAC_CTX *tl_hmac_ctx;
+
+static EVP_MAC_CTX *hmac_ctx(void)
+{
+    if (!tl_hmac)
+        tl_hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!tl_hmac)
+        return NULL;
+    if (!tl_hmac_ctx)
+        tl_hmac_ctx = EVP_MAC_CTX_new(tl_hmac);
+    return tl_hmac_ctx;
+}
+
 int spt_mac_sign(const uint8_t key[SPT_KEY_LEN],
                  const uint8_t aad[SPT_FRAME_HEADER_LEN],
                  const uint8_t *data,
@@ -170,8 +184,7 @@ int spt_mac_sign(const uint8_t key[SPT_KEY_LEN],
 {
     if (!key || !aad || !tag || (data_len > 0 && !data) || data_len > SPT_MAX_PLAIN)
         return -1;
-    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
-    EVP_MAC_CTX *ctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+    EVP_MAC_CTX *ctx = hmac_ctx();
     char digest[] = "SHA256";
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
@@ -194,8 +207,10 @@ int spt_mac_sign(const uint8_t key[SPT_KEY_LEN],
     memcpy(tag, full, SPT_TAG_LEN);
     rc = 0;
 done:
-    EVP_MAC_CTX_free(ctx);
-    EVP_MAC_free(mac);
+    if (rc != 0 && tl_hmac_ctx) {
+        EVP_MAC_CTX_free(tl_hmac_ctx);
+        tl_hmac_ctx = NULL;
+    }
     OPENSSL_cleanse(full, sizeof(full));
     return rc;
 }

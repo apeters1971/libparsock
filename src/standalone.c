@@ -20,13 +20,21 @@
 #include <pthread.h>
 #include <sys/socket.h>
 
+struct io_lane {
+    struct ps_runtime *rt;
+    int index;
+    int wake_r;
+    int wake_w;
+    pthread_t thread;
+};
+
 struct ps_runtime {
     ps_session_t *session;
     struct ps_listener *listener;
-    pthread_t thread;
-    int wake[2];
+    int nlanes;
     int stop;
     int started;
+    struct io_lane *lanes;
 };
 
 struct map_node {
@@ -64,9 +72,15 @@ struct ps_connection {
 static void rt_poke(void *ctx)
 {
     struct ps_runtime *rt = (struct ps_runtime *)ctx;
-    char byte = 1;
-    ssize_t n = write(rt->wake[1], &byte, 1);
-    (void)n;
+    if (!rt || !rt->lanes)
+        return;
+    for (int i = 0; i < rt->nlanes; i++) {
+        if (rt->lanes[i].wake_w < 0)
+            continue;
+        char byte = 1;
+        ssize_t n = write(rt->lanes[i].wake_w, &byte, 1);
+        (void)n;
+    }
 }
 
 static void rt_want(void *ctx, int fd, int want_read, int want_write)
@@ -145,16 +159,30 @@ static void drain_wake(int fd)
     }
 }
 
+static int lane_owns(const struct io_lane *lane, int fd)
+{
+    int n = lane->rt->nlanes;
+    if (n <= 1)
+        return 1;
+    int m = fd % n;
+    if (m < 0)
+        m += n;
+    return m == lane->index;
+}
+
 static void *runtime_main(void *arg)
 {
-    struct ps_runtime *rt = (struct ps_runtime *)arg;
+    struct io_lane *lane = (struct io_lane *)arg;
+    struct ps_runtime *rt = lane->rt;
     while (!rt->stop) {
-        for (int spin = 0; spin < 8 && !rt->stop; spin++) {
+        for (int spin = 0; spin < 4 && !rt->stop; spin++) {
             ps_embed_service(rt->session);
             ps_session_progress(rt->session);
             struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
             int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
             for (int i = 0; i < nw; i++) {
+                if (!lane_owns(lane, watches[i].fd))
+                    continue;
                 if (watches[i].want_write)
                     ps_on_writable(rt->session, watches[i].fd);
             }
@@ -162,6 +190,8 @@ static void *runtime_main(void *arg)
                 break;
             nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
             for (int i = 0; i < nw; i++) {
+                if (!lane_owns(lane, watches[i].fd))
+                    continue;
                 if (watches[i].want_read)
                     ps_on_readable(rt->session, watches[i].fd);
             }
@@ -173,21 +203,31 @@ static void *runtime_main(void *arg)
         struct ps_watch watches[PS_MAX_SUBFLOWS + 2];
         int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 2);
         struct pollfd pfds[PS_MAX_SUBFLOWS + 3];
-        pfds[0].fd = rt->wake[0];
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
+        int np = 0;
+        pfds[np].fd = lane->wake_r;
+        pfds[np].events = POLLIN;
+        pfds[np].revents = 0;
+        np++;
         for (int i = 0; i < nw; i++) {
-            pfds[i + 1].fd = watches[i].fd;
-            pfds[i + 1].events = 0;
+            if (!lane_owns(lane, watches[i].fd))
+                continue;
+            pfds[np].fd = watches[i].fd;
+            pfds[np].events = 0;
             if (watches[i].want_read)
-                pfds[i + 1].events |= POLLIN;
+                pfds[np].events |= POLLIN;
             if (watches[i].want_write)
-                pfds[i + 1].events |= POLLOUT;
-            pfds[i + 1].revents = 0;
+                pfds[np].events |= POLLOUT;
+            pfds[np].revents = 0;
+            watches[np - 1] = watches[i];
+            np++;
         }
-        int timeout = ps_session_local_pending(rt->session) ? 0
-                                                            : ps_session_next_timeout_ms(rt->session);
-        int pr = poll(pfds, (nfds_t)(nw + 1), timeout);
+        int owned_ready = 0;
+        for (int i = 1; i < np; i++) {
+            if (pfds[i].events != 0)
+                owned_ready = 1;
+        }
+        int timeout = owned_ready ? 0 : ps_session_next_timeout_ms(rt->session);
+        int pr = poll(pfds, (nfds_t)np, timeout);
         if (rt->stop)
             break;
         if (pr < 0) {
@@ -197,35 +237,82 @@ static void *runtime_main(void *arg)
             break;
         }
         if (pfds[0].revents & POLLIN)
-            drain_wake(rt->wake[0]);
-        for (int i = 0; i < nw; i++) {
-            short ev = pfds[i + 1].revents;
+            drain_wake(lane->wake_r);
+        for (int i = 1; i < np; i++) {
+            short ev = pfds[i].revents;
             if (ev & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
-                ps_on_readable(rt->session, watches[i].fd);
+                ps_on_readable(rt->session, watches[i - 1].fd);
             if (ev & POLLOUT)
-                ps_on_writable(rt->session, watches[i].fd);
+                ps_on_writable(rt->session, watches[i - 1].fd);
         }
-        ps_session_scale_tick(rt->session);
+        if (lane->index == 0)
+            ps_session_scale_tick(rt->session);
     }
     return NULL;
 }
 
-static int start_runtime(struct ps_runtime *rt)
+static int open_lane_pipe(struct io_lane *lane)
 {
-    if (pipe(rt->wake) != 0)
+    int fds[2];
+    if (pipe(fds) != 0)
         return -1;
     for (int i = 0; i < 2; i++) {
-        int flags = fcntl(rt->wake[i], F_GETFL, 0);
+        int flags = fcntl(fds[i], F_GETFL, 0);
         if (flags >= 0)
-            fcntl(rt->wake[i], F_SETFL, flags | O_NONBLOCK);
-        flags = fcntl(rt->wake[i], F_GETFD, 0);
+            fcntl(fds[i], F_SETFL, flags | O_NONBLOCK);
+        flags = fcntl(fds[i], F_GETFD, 0);
         if (flags >= 0)
-            fcntl(rt->wake[i], F_SETFD, flags | FD_CLOEXEC);
+            fcntl(fds[i], F_SETFD, flags | FD_CLOEXEC);
     }
-    if (pthread_create(&rt->thread, NULL, runtime_main, rt) != 0) {
-        close(rt->wake[0]);
-        close(rt->wake[1]);
+    lane->wake_r = fds[0];
+    lane->wake_w = fds[1];
+    return 0;
+}
+
+static void close_lane_pipe(struct io_lane *lane)
+{
+    if (lane->wake_r >= 0)
+        close(lane->wake_r);
+    if (lane->wake_w >= 0)
+        close(lane->wake_w);
+    lane->wake_r = lane->wake_w = -1;
+}
+
+static int start_runtime(struct ps_runtime *rt)
+{
+    unsigned n = ps_session_io_lanes(rt->session);
+    rt->lanes = (struct io_lane *)calloc(n, sizeof(*rt->lanes));
+    if (!rt->lanes)
         return -1;
+    rt->nlanes = (int)n;
+    for (unsigned i = 0; i < n; i++) {
+        rt->lanes[i].rt = rt;
+        rt->lanes[i].index = (int)i;
+        rt->lanes[i].wake_r = rt->lanes[i].wake_w = -1;
+        if (open_lane_pipe(&rt->lanes[i]) != 0) {
+            for (unsigned j = 0; j < i; j++)
+                close_lane_pipe(&rt->lanes[j]);
+            free(rt->lanes);
+            rt->lanes = NULL;
+            rt->nlanes = 0;
+            return -1;
+        }
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (pthread_create(&rt->lanes[i].thread, NULL, runtime_main, &rt->lanes[i]) != 0) {
+            rt->stop = 1;
+            rt->nlanes = (int)i;
+            rt_poke(rt);
+            for (unsigned j = 0; j < i; j++)
+                pthread_join(rt->lanes[j].thread, NULL);
+            for (unsigned j = 0; j < n; j++)
+                close_lane_pipe(&rt->lanes[j]);
+            free(rt->lanes);
+            rt->lanes = NULL;
+            rt->nlanes = 0;
+            rt->stop = 0;
+            return -1;
+        }
     }
     rt->started = 1;
     return 0;
@@ -236,17 +323,19 @@ static void stop_runtime(struct ps_runtime *rt)
     if (!rt)
         return;
     rt->stop = 1;
-    if (rt->wake[1] >= 0)
-        rt_poke(rt);
+    rt_poke(rt);
     if (rt->started) {
-        pthread_join(rt->thread, NULL);
+        for (int i = 0; i < rt->nlanes; i++)
+            pthread_join(rt->lanes[i].thread, NULL);
         rt->started = 0;
     }
-    if (rt->wake[0] >= 0)
-        close(rt->wake[0]);
-    if (rt->wake[1] >= 0)
-        close(rt->wake[1]);
-    rt->wake[0] = rt->wake[1] = -1;
+    if (rt->lanes) {
+        for (int i = 0; i < rt->nlanes; i++)
+            close_lane_pipe(&rt->lanes[i]);
+        free(rt->lanes);
+        rt->lanes = NULL;
+    }
+    rt->nlanes = 0;
 }
 
 static uint32_t timeout_or(uint32_t value, uint32_t fallback)
@@ -484,7 +573,6 @@ static ps_connection_t *finish_server(struct ps_listener *ln, int fd, SSL *ssl)
         return NULL;
     }
     rt->listener = ln;
-    rt->wake[0] = rt->wake[1] = -1;
     ps_io_cbs io;
     memset(&io, 0, sizeof(io));
     io.ctx = rt;
@@ -607,7 +695,6 @@ ps_connection_t *ps_connect(const char *host, uint16_t port, const struct ps_opt
         close(fd);
         return NULL;
     }
-    rt->wake[0] = rt->wake[1] = -1;
     ps_io_cbs io;
     memset(&io, 0, sizeof(io));
     io.ctx = rt;

@@ -181,6 +181,7 @@ struct ps_session {
     int got_eos;
     int in_user_read;
     int rx_hold;
+    int send_hold;
     int send_stalled;
     int need_export;
     int root_valid;
@@ -2013,7 +2014,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
 static void session_destroy(struct ps_session *s)
 {
     lock_s(s);
-    while (s->rx_hold)
+    while (s->rx_hold || s->send_hold)
         pthread_cond_wait(&s->cv, &s->mu);
     unlock_s(s);
     ps_session_stop_workers(s);
@@ -2558,18 +2559,32 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
         }
         if (n > max_bytes - sent)
             n = max_bytes - sent;
+        struct wire_slot *slot = preface ? NULL : sf->out_head;
+        session->send_hold++;
+        unlock_s(session);
         ssize_t wr;
 #if defined(MSG_NOSIGNAL)
         wr = send(fd, p, n, MSG_NOSIGNAL);
 #else
         wr = send(fd, p, n, 0);
 #endif
+        int errn = errno;
+        lock_s(session);
+        sf = sf_by_fd(session, fd);
         if (wr < 0) {
-            if (errno == EINTR) {
+            if (session->send_hold)
+                session->send_hold--;
+            pthread_cond_broadcast(&session->cv);
+            if (!sf || session->state == PS_STATE_FAILED) {
+                int err = session->err;
+                unlock_s(session);
+                return err ? -err : PS_OK;
+            }
+            if (errn == EINTR) {
                 unlock_s(session);
                 continue;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errn == EAGAIN || errn == EWOULDBLOCK) {
                 sf->want_write = 1;
                 unlock_s(session);
                 break;
@@ -2579,24 +2594,34 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
             unlock_s(session);
             return -err;
         }
+        if (!sf || sf->connecting || session->state == PS_STATE_FAILED) {
+            if (session->send_hold)
+                session->send_hold--;
+            pthread_cond_broadcast(&session->cv);
+            int err = session->err;
+            unlock_s(session);
+            return err ? -err : PS_OK;
+        }
         if (preface) {
             sf->preface_off += (size_t)wr;
-        } else {
-            sf->out_head->off += (size_t)wr;
-            if (sf->out_head->off == sf->out_head->len) {
-                struct wire_slot *dead = sf->out_head;
-                sf->out_head = dead->next;
+        } else if (slot && sf->out_head == slot) {
+            slot->off += (size_t)wr;
+            if (slot->off == slot->len) {
+                sf->out_head = slot->next;
                 if (!sf->out_head)
                     sf->out_tail = NULL;
-                if (sf->out_bytes >= dead->len)
-                    sf->out_bytes -= dead->len;
+                if (sf->out_bytes >= slot->len)
+                    sf->out_bytes -= slot->len;
                 session->records_tx++;
-                free(dead->frame);
-                free(dead);
+                free(slot->frame);
+                free(slot);
                 try_end_locked(session, sf);
                 pthread_cond_broadcast(&session->cv);
             }
         }
+        if (session->send_hold)
+            session->send_hold--;
+        pthread_cond_broadcast(&session->cv);
         refresh_write_locked(session, sf);
         sent += (size_t)wr;
         unlock_s(session);
@@ -3033,6 +3058,18 @@ int ps_embed_service(ps_session_t *session)
     int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
     unlock_s(session);
     return err ? -err : PS_OK;
+}
+
+unsigned ps_session_io_lanes(const ps_session_t *session)
+{
+    if (!session)
+        return 1;
+    unsigned n = ((const struct ps_session *)session)->initial_sockets;
+    if (n < 1)
+        n = 1;
+    if (n > 16)
+        n = 16;
+    return n;
 }
 
 int ps_session_snap_fds(const ps_session_t *session, int *fds, int *data, int max)
