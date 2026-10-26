@@ -1,4 +1,4 @@
-#include "spt_wire.h"
+#include "crypto.h"
 
 #include "endian.h"
 
@@ -214,18 +214,46 @@ int spt_mac_verify(const uint8_t key[SPT_KEY_LEN],
     return diff == 0 ? 0 : -1;
 }
 
-int spt_aead_seal(uint16_t alg,
-                  const uint8_t key[SPT_KEY_LEN],
-                  const uint8_t static_iv[SPT_IV_LEN],
-                  uint64_t record_sequence,
-                  const uint8_t aad[SPT_FRAME_HEADER_LEN],
-                  const uint8_t *plaintext,
-                  size_t plaintext_len,
-                  uint8_t *ciphertext,
-                  uint8_t tag[SPT_TAG_LEN])
+EVP_CIPHER_CTX *spt_aead_ctx_new(void)
+{
+    return EVP_CIPHER_CTX_new();
+}
+
+void spt_aead_ctx_free(EVP_CIPHER_CTX *ctx)
+{
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+/* A context that already has this cipher keeps its IV length. */
+static int aead_init(EVP_CIPHER_CTX *ctx, int encrypt, const EVP_CIPHER *cipher,
+                     const uint8_t *key, const uint8_t *nonce)
+{
+    if (EVP_CIPHER_CTX_get0_cipher(ctx) != cipher) {
+        int ok = encrypt ? EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL)
+                         : EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL);
+        if (ok != 1)
+            return -1;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, SPT_IV_LEN, NULL) != 1)
+            return -1;
+    }
+    int ok = encrypt ? EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce)
+                     : EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce);
+    return ok == 1 ? 0 : -1;
+}
+
+int spt_aead_seal_ctx(EVP_CIPHER_CTX *ctx,
+                      uint16_t alg,
+                      const uint8_t key[SPT_KEY_LEN],
+                      const uint8_t static_iv[SPT_IV_LEN],
+                      uint64_t record_sequence,
+                      const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                      const uint8_t *plaintext,
+                      size_t plaintext_len,
+                      uint8_t *ciphertext,
+                      uint8_t tag[SPT_TAG_LEN])
 {
     const EVP_CIPHER *cipher = cipher_for(alg);
-    if (!cipher || !key || !static_iv || !aad || !tag)
+    if (!ctx || !cipher || !key || !static_iv || !aad || !tag)
         return -1;
     if (plaintext_len > 0 && (!plaintext || !ciphertext))
         return -1;
@@ -237,14 +265,7 @@ int spt_aead_seal(uint16_t alg,
     int rc = -1;
     int len = 0;
     int outl = 0;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-        goto done;
-    if (EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1)
-        goto done;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, SPT_IV_LEN, NULL) != 1)
-        goto done;
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
+    if (aead_init(ctx, 1, cipher, key, nonce) != 0)
         goto done;
     if (EVP_EncryptUpdate(ctx, NULL, &len, aad, SPT_FRAME_HEADER_LEN) != 1)
         goto done;
@@ -262,23 +283,44 @@ int spt_aead_seal(uint16_t alg,
         goto done;
     rc = 0;
 done:
-    EVP_CIPHER_CTX_free(ctx);
+    if (rc != 0)
+        EVP_CIPHER_CTX_reset(ctx);
     OPENSSL_cleanse(nonce, sizeof(nonce));
     return rc;
 }
 
-int spt_aead_open(uint16_t alg,
+int spt_aead_seal(uint16_t alg,
                   const uint8_t key[SPT_KEY_LEN],
                   const uint8_t static_iv[SPT_IV_LEN],
                   uint64_t record_sequence,
                   const uint8_t aad[SPT_FRAME_HEADER_LEN],
-                  const uint8_t *ciphertext,
-                  size_t ciphertext_len,
-                  const uint8_t tag[SPT_TAG_LEN],
-                  uint8_t *plaintext)
+                  const uint8_t *plaintext,
+                  size_t plaintext_len,
+                  uint8_t *ciphertext,
+                  uint8_t tag[SPT_TAG_LEN])
+{
+    EVP_CIPHER_CTX *ctx = spt_aead_ctx_new();
+    if (!ctx)
+        return -1;
+    int rc = spt_aead_seal_ctx(ctx, alg, key, static_iv, record_sequence, aad, plaintext,
+                               plaintext_len, ciphertext, tag);
+    spt_aead_ctx_free(ctx);
+    return rc;
+}
+
+int spt_aead_open_ctx(EVP_CIPHER_CTX *ctx,
+                      uint16_t alg,
+                      const uint8_t key[SPT_KEY_LEN],
+                      const uint8_t static_iv[SPT_IV_LEN],
+                      uint64_t record_sequence,
+                      const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                      const uint8_t *ciphertext,
+                      size_t ciphertext_len,
+                      const uint8_t tag[SPT_TAG_LEN],
+                      uint8_t *plaintext)
 {
     const EVP_CIPHER *cipher = cipher_for(alg);
-    if (!cipher || !key || !static_iv || !aad || !tag)
+    if (!ctx || !cipher || !key || !static_iv || !aad || !tag)
         return -1;
     if (ciphertext_len > SPT_MAX_PLAIN)
         return -1;
@@ -290,14 +332,7 @@ int spt_aead_open(uint16_t alg,
     int rc = -1;
     int len = 0;
     int outl = 0;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-        goto done;
-    if (EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1)
-        goto done;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, SPT_IV_LEN, NULL) != 1)
-        goto done;
-    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
+    if (aead_init(ctx, 0, cipher, key, nonce) != 0)
         goto done;
     if (EVP_DecryptUpdate(ctx, NULL, &len, aad, SPT_FRAME_HEADER_LEN) != 1)
         goto done;
@@ -312,7 +347,27 @@ int spt_aead_open(uint16_t alg,
         goto done;
     rc = 0;
 done:
-    EVP_CIPHER_CTX_free(ctx);
+    if (rc != 0)
+        EVP_CIPHER_CTX_reset(ctx);
     OPENSSL_cleanse(nonce, sizeof(nonce));
+    return rc;
+}
+
+int spt_aead_open(uint16_t alg,
+                  const uint8_t key[SPT_KEY_LEN],
+                  const uint8_t static_iv[SPT_IV_LEN],
+                  uint64_t record_sequence,
+                  const uint8_t aad[SPT_FRAME_HEADER_LEN],
+                  const uint8_t *ciphertext,
+                  size_t ciphertext_len,
+                  const uint8_t tag[SPT_TAG_LEN],
+                  uint8_t *plaintext)
+{
+    EVP_CIPHER_CTX *ctx = spt_aead_ctx_new();
+    if (!ctx)
+        return -1;
+    int rc = spt_aead_open_ctx(ctx, alg, key, static_iv, record_sequence, aad, ciphertext,
+                               ciphertext_len, tag, plaintext);
+    spt_aead_ctx_free(ctx);
     return rc;
 }

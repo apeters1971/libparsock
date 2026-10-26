@@ -1,3 +1,4 @@
+#include "crypto.h"
 #include "spt_wire.h"
 
 #include <stdio.h>
@@ -142,6 +143,31 @@ static void roundtrip(uint16_t alg, const char *name)
     expect(spt_aead_open(alg, key, iv, 7, aad, ct, sizeof(ct), tag, out) != 0, "tamper ct");
     expect(spt_aead_seal(alg, key, iv, 9, aad, NULL, 0, NULL, tag) == 0, "empty seal");
     expect(spt_aead_open(alg, key, iv, 9, aad, NULL, 0, tag, NULL) == 0, "empty open");
+
+    EVP_CIPHER_CTX *seal = spt_aead_ctx_new();
+    EVP_CIPHER_CTX *open = spt_aead_ctx_new();
+    expect(seal && open, "ctx");
+    uint8_t ct_ref[32], tag_ref[16], ct1[32], tag1[16], ct2[32], tag2[16], again[32];
+    expect(spt_aead_seal(alg, key, iv, 7, aad, pt, sizeof(pt), ct_ref, tag_ref) == 0, "fresh");
+    expect(spt_aead_seal_ctx(seal, alg, key, iv, 7, aad, pt, sizeof(pt), ct1, tag1) == 0,
+           "reuse seal");
+    expect(memcmp(ct1, ct_ref, sizeof(ct1)) == 0 && memcmp(tag1, tag_ref, sizeof(tag1)) == 0,
+           "reuse match");
+    expect(spt_aead_seal_ctx(seal, alg, key, iv, 8, aad, pt, sizeof(pt), ct2, tag2) == 0,
+           "reuse seal 2");
+    expect(memcmp(ct1, ct2, sizeof(ct1)) != 0, "reuse seq");
+    expect(spt_aead_open_ctx(open, alg, key, iv, 7, aad, ct1, sizeof(ct1), tag1, again) == 0,
+           "reuse open");
+    expect(memcmp(again, pt, sizeof(pt)) == 0, "reuse plain");
+    tag2[0] ^= 1;
+    expect(spt_aead_open_ctx(open, alg, key, iv, 8, aad, ct2, sizeof(ct2), tag2, again) != 0,
+           "reuse tamper");
+    tag2[0] ^= 1;
+    expect(spt_aead_open_ctx(open, alg, key, iv, 8, aad, ct2, sizeof(ct2), tag2, again) == 0,
+           "reuse after failure");
+    expect(memcmp(again, pt, sizeof(pt)) == 0, "reuse plain 2");
+    spt_aead_ctx_free(seal);
+    spt_aead_ctx_free(open);
     uint8_t hash[32];
     expect(spt_sha256((const uint8_t *)"abc", 3, hash) == 0, "sha");
     static const uint8_t abc[32] = {

@@ -2,6 +2,7 @@
 
 #include "autoscale.h"
 #include "clock.h"
+#include "crypto.h"
 #include "discover.h"
 #include "endian.h"
 #include "log.h"
@@ -23,6 +24,8 @@
 
 #define ACT_MAX 48
 #define RX_PIPELINE 4
+/* One context per in-flight record. A context is not shared across workers. */
+#define SF_AEAD_SLOTS 4
 
 enum {
     ACT_IO = 1,
@@ -95,6 +98,9 @@ struct crypto_job {
     struct plain_slot *pslot;
     struct subflow *sf;
     struct crypto_job *next;
+    EVP_CIPHER_CTX *aead_ctx;
+    int aead_owned;
+    int aead_slot;
 };
 
 struct gen_mat {
@@ -148,6 +154,10 @@ struct subflow {
     struct plain_slot *in_head;
     struct plain_slot *in_tail;
     unsigned in_flight;
+    EVP_CIPHER_CTX *seal_ctx[SF_AEAD_SLOTS];
+    EVP_CIPHER_CTX *open_ctx[SF_AEAD_SLOTS];
+    uint8_t seal_busy;
+    uint8_t open_busy;
 };
 
 struct ps_session {
@@ -535,10 +545,48 @@ static void refresh_write_locked(struct ps_session *s, struct subflow *sf)
         queue_io(s, sf->fd, sf->want_read, sf->want_write);
 }
 
+/* Caller holds the session lock. Returns a context owned by this socket. */
+static EVP_CIPHER_CTX *sf_take_aead(struct subflow *sf, int open, int *slot, int *owned)
+{
+    EVP_CIPHER_CTX **pool = open ? sf->open_ctx : sf->seal_ctx;
+    uint8_t *busy = open ? &sf->open_busy : &sf->seal_busy;
+    for (int i = 0; i < SF_AEAD_SLOTS; i++) {
+        if (*busy & (uint8_t)(1u << i))
+            continue;
+        if (!pool[i]) {
+            pool[i] = spt_aead_ctx_new();
+            if (!pool[i])
+                return NULL;
+        }
+        *busy = (uint8_t)(*busy | (uint8_t)(1u << i));
+        *slot = i;
+        *owned = 0;
+        return pool[i];
+    }
+    *slot = -1;
+    *owned = 1;
+    return spt_aead_ctx_new();
+}
+
+/* Caller holds the session lock, or is the last thread left in session_destroy. */
+static void release_aead(struct crypto_job *job)
+{
+    if (!job || !job->aead_ctx)
+        return;
+    if (job->aead_owned) {
+        spt_aead_ctx_free(job->aead_ctx);
+    } else if (job->sf && job->aead_slot >= 0 && job->aead_slot < SF_AEAD_SLOTS) {
+        uint8_t *busy = job->op_open ? &job->sf->open_busy : &job->sf->seal_busy;
+        *busy = (uint8_t)(*busy & (uint8_t)~(1u << job->aead_slot));
+    }
+    job->aead_ctx = NULL;
+}
+
 static void free_job(struct crypto_job *job)
 {
     if (!job)
         return;
+    release_aead(job);
     if (job->in)
         OPENSSL_cleanse(job->in, job->in_len ? job->in_len : 1);
     free(job->in);
@@ -561,12 +609,14 @@ static int execute_job(struct crypto_job *job)
             memcpy(job->out, in, job->in_len);
         return spt_mac_sign(job->key, job->aad, in, job->in_len, job->tag);
     }
+    if (!job->aead_ctx)
+        return -1;
     if (job->op_open) {
-        return spt_aead_open(job->alg, job->key, job->iv, job->seq, job->aad,
-                             in, job->in_len, job->tag, job->out);
+        return spt_aead_open_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                                 in, job->in_len, job->tag, job->out);
     }
-    return spt_aead_seal(job->alg, job->key, job->iv, job->seq, job->aad,
-                         in, job->in_len, job->out, job->tag);
+    return spt_aead_seal_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                             in, job->in_len, job->out, job->tag);
 }
 
 static void submit_job_locked(struct ps_session *s, struct crypto_job *job)
@@ -641,10 +691,10 @@ static void *worker_main(void *arg)
         int ok = execute_job(job);
         lock_s(s);
         finish_job_locked(s, job, ok);
+        free_job(job);
         unlock_s(s);
         if (s->io.poke)
             s->io.poke(s->io.ctx);
-        free_job(job);
     }
     return NULL;
 }
@@ -730,6 +780,15 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     job->tag = frame + SPT_FRAME_HEADER_LEN + plain_len;
     job->wslot = slot;
     job->sf = sf;
+    job->aead_slot = -1;
+    if (!job->mac) {
+        job->aead_ctx = sf_take_aead(sf, 0, &job->aead_slot, &job->aead_owned);
+        if (!job->aead_ctx) {
+            free_job(job);
+            fail_locked(s, PS_ERR_NOMEM);
+            return -1;
+        }
+    }
     sf->send_seq++;
     submit_job_locked(s, job);
     queue_poke(s);
@@ -1077,6 +1136,15 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
         job->tag = job->tag_store;
         job->pslot = slot;
         job->sf = sf;
+        job->aead_slot = -1;
+        if (!job->mac) {
+            job->aead_ctx = sf_take_aead(sf, 1, &job->aead_slot, &job->aead_owned);
+            if (!job->aead_ctx) {
+                free_job(job);
+                fail_locked(s, PS_ERR_NOMEM);
+                break;
+            }
+        }
         submit_job_locked(s, job);
         (*budget)--;
     }
@@ -1764,14 +1832,16 @@ static void run_ready_work(struct ps_session *s)
         if (!job)
             break;
         if (failed) {
+            lock_s(s);
             free_job(job);
+            unlock_s(s);
             continue;
         }
         int ok = execute_job(job);
         lock_s(s);
         finish_job_locked(s, job, ok);
-        unlock_s(s);
         free_job(job);
+        unlock_s(s);
     }
 }
 
@@ -1963,6 +2033,15 @@ static void session_destroy(struct ps_session *s)
         free_job(j);
     }
     pthread_mutex_unlock(&s->job_mu);
+    for (uint32_t i = 0; i < PS_MAX_SUBFLOWS; i++) {
+        struct subflow *sf = &s->sf[i];
+        for (int n = 0; n < SF_AEAD_SLOTS; n++) {
+            spt_aead_ctx_free(sf->seal_ctx[n]);
+            spt_aead_ctx_free(sf->open_ctx[n]);
+            sf->seal_ctx[n] = NULL;
+            sf->open_ctx[n] = NULL;
+        }
+    }
     spt_reassembly_free(&s->reassembly);
     buf_free(&s->cin);
     buf_free(&s->cout);
