@@ -261,6 +261,7 @@ struct ready {
     uint16_t cport;
     uint16_t dport;
     int go;
+    int client_done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
 };
@@ -326,6 +327,10 @@ static void *server_thread(void *arg)
     if (drive(&side, now_ms() + 15000, NULL, &got, NULL, 0, NULL, 0, 1) != 0)
         sv->rc = 1;
     sv->echoed = got;
+    pthread_mutex_lock(&sv->ready->mu);
+    while (!sv->ready->client_done)
+        pthread_cond_wait(&sv->ready->cv, &sv->ready->mu);
+    pthread_mutex_unlock(&sv->ready->mu);
     ps_embed_close(side.session);
     close(cfd);
     close(dfd);
@@ -413,6 +418,10 @@ int main(int argc, char **argv)
         tx[i] = pattern(i);
     size_t sent = 0, got = 0;
     int rc = drive(&side, now_ms() + 15000, &sent, &got, tx, N, rx, N, 0);
+    pthread_mutex_lock(&ready.mu);
+    ready.client_done = 1;
+    pthread_cond_signal(&ready.cv);
+    pthread_mutex_unlock(&ready.mu);
     expect(rc == 0, "drive");
     expect(sent == N && got == N, "byte count");
     expect(got == N && memcmp(tx, rx, N) == 0, "bytes match");
