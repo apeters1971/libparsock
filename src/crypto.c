@@ -270,7 +270,7 @@ int spt_aead_seal_ctx(EVP_CIPHER_CTX *ctx,
     const EVP_CIPHER *cipher = cipher_for(alg);
     if (!ctx || !cipher || !key || !static_iv || !aad || !tag)
         return -1;
-    if (plaintext_len > 0 && (!plaintext || !ciphertext))
+    if (plaintext_len > 0 && !plaintext)
         return -1;
     if (plaintext_len > SPT_MAX_PLAIN)
         return -1;
@@ -287,7 +287,7 @@ int spt_aead_seal_ctx(EVP_CIPHER_CTX *ctx,
     if (plaintext_len > 0) {
         if (EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, (int)plaintext_len) != 1)
             goto done;
-        if ((size_t)len != plaintext_len)
+        if (ciphertext && (size_t)len != plaintext_len)
             goto done;
     }
     if (EVP_EncryptFinal_ex(ctx, ciphertext ? ciphertext + plaintext_len : NULL, &outl) != 1)
@@ -339,7 +339,7 @@ int spt_aead_open_ctx(EVP_CIPHER_CTX *ctx,
         return -1;
     if (ciphertext_len > SPT_MAX_PLAIN)
         return -1;
-    if (ciphertext_len > 0 && (!ciphertext || !plaintext))
+    if (ciphertext_len > 0 && !ciphertext)
         return -1;
 
     uint8_t nonce[SPT_IV_LEN];
@@ -353,6 +353,8 @@ int spt_aead_open_ctx(EVP_CIPHER_CTX *ctx,
         goto done;
     if (ciphertext_len > 0) {
         if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, (int)ciphertext_len) != 1)
+            goto done;
+        if (plaintext && (size_t)len != ciphertext_len)
             goto done;
     }
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, SPT_TAG_LEN, (void *)tag) != 1)

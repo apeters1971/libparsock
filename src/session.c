@@ -613,20 +613,16 @@ static void free_job(struct crypto_job *job)
 static int execute_job(struct crypto_job *job)
 {
     const uint8_t *in = job->in_len ? job->in : NULL;
-    if (job->mac) {
-        if (job->op_open) {
-            if (spt_mac_verify(job->key, job->aad, in, job->in_len, job->tag) != 0)
-                return -1;
-            if (job->in_len && job->out && job->out != in)
-                memcpy(job->out, in, job->in_len);
-            return 0;
-        }
-        if (job->in_len && job->out)
-            memcpy(job->out, in, job->in_len);
-        return spt_mac_sign(job->key, job->aad, in, job->in_len, job->tag);
-    }
     if (!job->aead_ctx)
         return -1;
+    if (job->mac) {
+        if (job->op_open) {
+            return spt_aead_open_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                                     in, job->in_len, job->tag, NULL);
+        }
+        return spt_aead_seal_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
+                                 in, job->in_len, NULL, job->tag);
+    }
     if (job->op_open) {
         return spt_aead_open_ctx(job->aead_ctx, job->alg, job->key, job->iv, job->seq, job->aad,
                                  in, job->in_len, job->tag, job->out);
@@ -803,9 +799,10 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     job->op_open = 0;
     job->mac = protection == SPT_PROTECTION_AUTHENTICATED;
     job->alg = s->aead;
-    if (job->mac)
+    if (job->mac) {
         memcpy(job->key, g->send_mac, SPT_KEY_LEN);
-    else {
+        memcpy(job->iv, g->send_iv, SPT_IV_LEN);
+    } else {
         memcpy(job->key, g->send_key, SPT_KEY_LEN);
         memcpy(job->iv, g->send_iv, SPT_IV_LEN);
     }
@@ -830,13 +827,11 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     job->wslot = slot;
     job->sf = sf;
     job->aead_slot = -1;
-    if (!job->mac) {
-        job->aead_ctx = sf_take_aead(sf, 0, &job->aead_slot, &job->aead_owned);
-        if (!job->aead_ctx) {
-            free_job(job);
-            fail_locked(s, PS_ERR_NOMEM);
-            return -1;
-        }
+    job->aead_ctx = sf_take_aead(sf, 0, &job->aead_slot, &job->aead_owned);
+    if (!job->aead_ctx) {
+        free_job(job);
+        fail_locked(s, PS_ERR_NOMEM);
+        return -1;
     }
     sf->send_seq++;
     submit_job_locked(s, job);
@@ -1198,9 +1193,10 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
         job->op_open = 1;
         job->mac = hdr.protection == SPT_PROTECTION_AUTHENTICATED;
         job->alg = s->aead;
-        if (job->mac)
+        if (job->mac) {
             memcpy(job->key, g->recv_mac, SPT_KEY_LEN);
-        else {
+            memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
+        } else {
             memcpy(job->key, g->recv_key, SPT_KEY_LEN);
             memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
         }
@@ -1214,13 +1210,11 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
         job->pslot = slot;
         job->sf = sf;
         job->aead_slot = -1;
-        if (!job->mac) {
-            job->aead_ctx = sf_take_aead(sf, 1, &job->aead_slot, &job->aead_owned);
-            if (!job->aead_ctx) {
-                free_job(job);
-                fail_locked(s, PS_ERR_NOMEM);
-                break;
-            }
+        job->aead_ctx = sf_take_aead(sf, 1, &job->aead_slot, &job->aead_owned);
+        if (!job->aead_ctx) {
+            free_job(job);
+            fail_locked(s, PS_ERR_NOMEM);
+            break;
         }
         submit_job_locked(s, job);
         (*budget)--;
