@@ -166,6 +166,20 @@ int ps_close(ps_connection_t *conn);
 int ps_connection_error(const ps_connection_t *conn);
 int ps_connection_state(const ps_connection_t *conn);
 int ps_connection_stats(const ps_connection_t *conn, struct ps_stats *out);
+
+/* One control socket (data == 0) followed by the connected data sockets.
+   sndbuf and rcvbuf are the raw getsockopt values. nodelay, nonblock, and
+   mss are -1 when the kernel does not report them. Returns the count. */
+struct ps_tcp_setting {
+    int data;
+    int nodelay;
+    int nonblock;
+    int sndbuf;
+    int rcvbuf;
+    int mss;
+};
+
+int ps_connection_tcp_settings(const ps_connection_t *conn, struct ps_tcp_setting *out, int max);
 int ps_connection_advice(const ps_connection_t *conn, struct ps_scale_advice *out);
 int ps_rekey(ps_connection_t *conn);
 

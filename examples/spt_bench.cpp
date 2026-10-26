@@ -983,6 +983,52 @@ std::string endpoint_title(const std::string &host, std::uint16_t port)
     return "SPT  " + host + ":" + std::to_string(port);
 }
 
+int kernel_buffer(int reported)
+{
+    if (reported < 0)
+        return reported;
+#if defined(__linux__)
+    /* getsockopt(SO_SNDBUF/SO_RCVBUF) returns twice the size the kernel kept. */
+    return reported / 2;
+#else
+    return reported;
+#endif
+}
+
+bool same_tcp(const ps_tcp_setting &a, const ps_tcp_setting &b)
+{
+    return a.data == b.data && a.nodelay == b.nodelay && a.nonblock == b.nonblock && a.sndbuf == b.sndbuf &&
+           a.rcvbuf == b.rcvbuf && a.mss == b.mss;
+}
+
+void print_tcp_settings(parsock::connection &conn)
+{
+    ps_tcp_setting items[PS_MAX_SUBFLOWS + 1];
+    const int n = ps_connection_tcp_settings(conn.native(), items, PS_MAX_SUBFLOWS + 1);
+    if (n <= 0) {
+        std::cerr << "tcp  settings unavailable\n";
+        return;
+    }
+    std::cerr << "tcp  SO_SNDBUF and SO_RCVBUF are the sizes the kernel kept";
+#if defined(__linux__)
+    std::cerr << "; getsockopt reports twice that";
+#endif
+    std::cerr << "\n";
+    for (int i = 0; i < n;) {
+        int count = 1;
+        while (i + count < n && same_tcp(items[i], items[i + count]))
+            count++;
+        const ps_tcp_setting &item = items[i];
+        std::cerr << "tcp  " << (item.data ? "data" : "control");
+        if (item.data)
+            std::cerr << " x" << count;
+        std::cerr << "  TCP_NODELAY " << item.nodelay << "  nonblock " << item.nonblock << "  SO_SNDBUF "
+                  << kernel_buffer(item.sndbuf) << "  SO_RCVBUF " << kernel_buffer(item.rcvbuf) << "  MSS "
+                  << item.mss << "\n";
+        i += count;
+    }
+}
+
 int run_endpoint(config cfg, bool server, const std::vector<std::string> &positionals)
 {
     if (server)
@@ -1016,6 +1062,7 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
         std::cerr << "listening " << cfg.bind_host << ":" << ports.control << "  " << aead_name(cfg.cipher)
                   << "  " << protection_name(cfg.protection) << "  sockets " << cfg.sockets << std::endl;
         parsock::connection conn = listener.accept();
+        print_tcp_settings(conn);
         const summary result = run_transfer(conn, cfg, endpoint_title(cfg.bind_host, ports.control), chart_on,
                                              interval_stdout, csv.is_open() ? &csv : nullptr);
         print_summary(result);
@@ -1028,6 +1075,7 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
     cfg.port = parse_port(positionals[1]);
     parsock::options opt = make_options(cfg, cfg.host, tls_use::client);
     parsock::connection conn = parsock::connection::connect(cfg.host, cfg.port, opt);
+    print_tcp_settings(conn);
     const summary result = run_transfer(conn, cfg, endpoint_title(cfg.host, cfg.port), chart_on, interval_stdout,
                                          csv.is_open() ? &csv : nullptr);
     print_summary(result);

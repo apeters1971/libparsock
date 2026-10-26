@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -711,6 +712,46 @@ int ps_connection_state(const ps_connection_t *conn)
 int ps_connection_stats(const ps_connection_t *conn, struct ps_stats *out)
 {
     return conn ? ps_session_stats(conn->session, out) : -PS_ERR_INVAL;
+}
+
+static int socket_int(int fd, int level, int name, int *out)
+{
+    int value = 0;
+    socklen_t len = sizeof(value);
+    if (getsockopt(fd, level, name, &value, &len) != 0)
+        return -1;
+    *out = value;
+    return 0;
+}
+
+int ps_connection_tcp_settings(const ps_connection_t *conn, struct ps_tcp_setting *out, int max)
+{
+    if (!conn || !out || max <= 0)
+        return -PS_ERR_INVAL;
+    int fds[PS_MAX_SUBFLOWS + 1];
+    int data[PS_MAX_SUBFLOWS + 1];
+    int n = ps_session_snap_fds(conn->session, fds, data, PS_MAX_SUBFLOWS + 1);
+    if (n > max)
+        n = max;
+    for (int i = 0; i < n; i++) {
+        int value = 0;
+        int flags = fcntl(fds[i], F_GETFL, 0);
+        out[i].data = data[i];
+        out[i].nodelay = -1;
+        out[i].nonblock = flags < 0 ? -1 : ((flags & O_NONBLOCK) ? 1 : 0);
+        out[i].sndbuf = -1;
+        out[i].rcvbuf = -1;
+        out[i].mss = -1;
+        if (socket_int(fds[i], IPPROTO_TCP, TCP_NODELAY, &value) == 0)
+            out[i].nodelay = value ? 1 : 0;
+        if (socket_int(fds[i], SOL_SOCKET, SO_SNDBUF, &value) == 0)
+            out[i].sndbuf = value;
+        if (socket_int(fds[i], SOL_SOCKET, SO_RCVBUF, &value) == 0)
+            out[i].rcvbuf = value;
+        if (socket_int(fds[i], IPPROTO_TCP, TCP_MAXSEG, &value) == 0)
+            out[i].mss = value;
+    }
+    return n;
 }
 
 int ps_connection_advice(const ps_connection_t *conn, struct ps_scale_advice *out)

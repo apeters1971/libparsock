@@ -2983,6 +2983,29 @@ int ps_embed_service(ps_session_t *session)
     return err ? -err : PS_OK;
 }
 
+int ps_session_snap_fds(const ps_session_t *session, int *fds, int *data, int max)
+{
+    if (!session || !fds || !data || max <= 0)
+        return 0;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    int n = 0;
+    if (s->ctrl_fd >= 0 && n < max) {
+        fds[n] = s->ctrl_fd;
+        data[n] = 0;
+        n++;
+    }
+    for (uint32_t i = 0; i < s->sf_count && n < max; i++) {
+        if (!s->sf[i].used || s->sf[i].fd < 0)
+            continue;
+        fds[n] = s->sf[i].fd;
+        data[n] = 1;
+        n++;
+    }
+    unlock_s(s);
+    return n;
+}
+
 int ps_session_watches(const ps_session_t *session, struct ps_watch *out, int max)
 {
     if (!session || !out || max <= 0)
