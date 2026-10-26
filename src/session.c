@@ -19,6 +19,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/socket.h>
+#include <sys/uio.h>
+
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
@@ -27,6 +30,7 @@
 /* One context per in-flight record. A context is not shared across workers. */
 #define SF_AEAD_SLOTS 16
 #define RX_BYTES (2u * 1024u * 1024u)
+#define FLUSH_IOV 16
 
 enum {
     ACT_IO = 1,
@@ -700,9 +704,10 @@ static void *worker_main(void *arg)
             s->job_tail = NULL;
         pthread_mutex_unlock(&s->job_mu);
         int ok = execute_job(job);
+        int opened = job->op_open;
         lock_s(s);
         finish_job_locked(s, job, ok);
-        if (s->state != PS_STATE_FAILED)
+        if (opened && s->state != PS_STATE_FAILED)
             apply_all_locked(s);
         free_job(job);
         unlock_s(s);
@@ -807,18 +812,10 @@ static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
     }
     job->seq = sf->send_seq;
     memcpy(job->aad, frame, SPT_FRAME_HEADER_LEN);
-    if (plain_len && job->mac) {
+    if (plain_len) {
         memcpy(frame + SPT_FRAME_HEADER_LEN, plain, plain_len);
         job->in = frame + SPT_FRAME_HEADER_LEN;
         job->keep_in = 1;
-    } else if (plain_len) {
-        job->in = (uint8_t *)malloc(plain_len);
-        if (!job->in) {
-            free_job(job);
-            fail_locked(s, PS_ERR_NOMEM);
-            return -1;
-        }
-        memcpy(job->in, plain, plain_len);
     }
     job->in_len = plain_len;
     job->out = frame + SPT_FRAME_HEADER_LEN;
@@ -1438,7 +1435,7 @@ static void handle_client_hello_locked(struct ps_session *s, const uint8_t *body
     }
     s->aead = ch.aead;
     s->frame_size = frame;
-    s->sf_hi = (size_t)frame * 16;
+    s->sf_hi = (size_t)frame * 32;
     s->max_sockets = cap;
     s->expect = want;
     s->send_limit = ch.recv_window;
@@ -1502,7 +1499,7 @@ static void handle_server_hello_locked(struct ps_session *s, const uint8_t *body
     memcpy(s->session_id, sh.session_id, SPT_SESSION_ID_LEN);
     s->have_server_hello = 1;
     s->frame_size = sh.frame_size;
-    s->sf_hi = s->frame_size * 16;
+    s->sf_hi = s->frame_size * 32;
     s->max_sockets = sh.max_sockets < s->max_sockets ? sh.max_sockets : s->max_sockets;
     if (s->min_sockets > s->max_sockets)
         s->min_sockets = s->max_sockets;
@@ -2069,7 +2066,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
     s->min_transfer_size = o.min_transfer_size;
     s->frame_size = o.frame_size;
     s->recv_window = o.receive_window;
-    s->sf_hi = o.frame_size * 16;
+    s->sf_hi = o.frame_size * 32;
     s->max_poller_bytes = o.max_poller_bytes;
     s->max_poller_records = o.max_poller_records;
     s->aead = (uint16_t)o.aead;
@@ -2601,6 +2598,7 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
     if (!session)
         return -PS_ERR_INVAL;
     size_t sent = 0;
+    struct iovec iov[FLUSH_IOV];
     while (sent < max_bytes) {
         lock_s(session);
         struct subflow *sf = sf_by_fd(session, fd);
@@ -2609,38 +2607,59 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
             unlock_s(session);
             return err ? -err : PS_OK;
         }
-        const uint8_t *p = NULL;
-        size_t n = 0;
+        int niov = 0;
         int preface = 0;
         if (sf->preface_off < sf->preface_len) {
-            p = sf->preface + sf->preface_off;
-            n = sf->preface_len - sf->preface_off;
+            size_t n = sf->preface_len - sf->preface_off;
+            if (n > max_bytes - sent)
+                n = max_bytes - sent;
+            iov[0].iov_base = (void *)(sf->preface + sf->preface_off);
+            iov[0].iov_len = n;
+            niov = 1;
             preface = 1;
-        } else if (sf->out_head && sf->out_head->ready) {
-            if (!sf->out_head->ok) {
-                fail_locked(session, PS_ERR_CRYPTO);
-                int err = session->err;
-                unlock_s(session);
-                return -err;
+        } else {
+            struct wire_slot *w = sf->out_head;
+            size_t planned = 0;
+            while (w && niov < FLUSH_IOV && planned < max_bytes - sent) {
+                if (!w->ready)
+                    break;
+                if (!w->ok) {
+                    fail_locked(session, PS_ERR_CRYPTO);
+                    int err = session->err;
+                    unlock_s(session);
+                    return -err;
+                }
+                size_t left = w->len - w->off;
+                if (left == 0) {
+                    w = w->next;
+                    continue;
+                }
+                size_t take = left;
+                if (take > max_bytes - sent - planned)
+                    take = max_bytes - sent - planned;
+                iov[niov].iov_base = w->frame + w->off;
+                iov[niov].iov_len = take;
+                planned += take;
+                niov++;
+                w = w->next;
             }
-            p = sf->out_head->frame + sf->out_head->off;
-            n = sf->out_head->len - sf->out_head->off;
         }
-        if (!p || n == 0) {
+        if (niov == 0) {
             refresh_write_locked(session, sf);
             unlock_s(session);
             break;
         }
-        if (n > max_bytes - sent)
-            n = max_bytes - sent;
-        struct wire_slot *slot = preface ? NULL : sf->out_head;
         session->send_hold++;
         unlock_s(session);
         ssize_t wr;
 #if defined(MSG_NOSIGNAL)
-        wr = send(fd, p, n, MSG_NOSIGNAL);
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = iov;
+        msg.msg_iovlen = (unsigned int)niov;
+        wr = sendmsg(fd, &msg, MSG_NOSIGNAL);
 #else
-        wr = send(fd, p, n, 0);
+        wr = writev(fd, iov, niov);
 #endif
         int errn = errno;
         lock_s(session);
@@ -2676,11 +2695,19 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
             unlock_s(session);
             return err ? -err : PS_OK;
         }
+        size_t remain = (size_t)wr;
+        int freed = 0;
         if (preface) {
-            sf->preface_off += (size_t)wr;
-        } else if (slot && sf->out_head == slot) {
-            slot->off += (size_t)wr;
-            if (slot->off == slot->len) {
+            sf->preface_off += remain;
+        } else {
+            while (remain > 0 && sf->out_head) {
+                struct wire_slot *slot = sf->out_head;
+                size_t left = slot->len - slot->off;
+                size_t adv = remain < left ? remain : left;
+                slot->off += adv;
+                remain -= adv;
+                if (slot->off != slot->len)
+                    break;
                 sf->out_head = slot->next;
                 if (!sf->out_head)
                     sf->out_tail = NULL;
@@ -2690,10 +2717,11 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
                 frame_put_locked(session, slot->frame, slot->len);
                 free(slot);
                 try_end_locked(session, sf);
-                if (session->send_stalled)
-                    pthread_cond_broadcast(&session->cv);
+                freed = 1;
             }
         }
+        if (freed && session->send_stalled)
+            pthread_cond_broadcast(&session->cv);
         if (session->send_hold)
             session->send_hold--;
         if (session->closing || session->state == PS_STATE_CLOSED)

@@ -774,9 +774,9 @@ void recv_direction(parsock::connection &conn, const config &cfg, meter &stats, 
             got += n;
             stats.rx.fetch_add(n);
         }
-        if (target != kUntilEof) {
+        if (target != kUntilEof && got >= target) {
             std::uint8_t extra = 0;
-            if (conn.recv(&extra, 1) != 0)
+            if (conn.recv(&extra, 1) > 0)
                 throw std::runtime_error("trailing bytes after payload");
         }
         stats.rx_end_ns.store(got == 0 ? stats.rx_start_ns.load() : now_ns());
