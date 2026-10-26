@@ -72,12 +72,12 @@ To carry a public response body without payload encryption, both processes pass 
 ./build/spt_http client cert.pem key.pem 127.0.0.1 <port> 1048576 public
 ```
 
-Benchmark between two machines. Use the same `--aead`, `--sockets`, and `--protection` on both ends. Authenticated mode keeps the payload in plaintext and still authenticates every record.
+Benchmark between two machines. Use the same `--aead`, `--sockets`, and `--protection` on both ends. Authenticated mode keeps the payload in plaintext and still authenticates every record. The server certificate encrypts the control connection. A client certificate is optional. A server started without `--cert` and `--key` writes a self-signed certificate for that connection.
 
 ```sh
-./build/spt_bench server --cert cert.pem --key key.pem --bind 0.0.0.0 --port 8443 \
+./build/spt_bench server --bind 0.0.0.0 --port 8443 \
     --aead aes-256-gcm --sockets 4 --protection confidential
-./build/spt_bench client 192.168.1.10 8443 --cert cert.pem --key key.pem \
+./build/spt_bench client 192.168.1.10 8443 \
     --aead aes-256-gcm --sockets 4 --protection confidential --bytes 8G
 ```
 

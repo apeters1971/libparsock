@@ -1,6 +1,10 @@
 #include "parsock.hpp"
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,7 +16,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,8 +26,12 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -242,12 +252,12 @@ void usage()
 {
     std::cerr
         << "usage:\n"
-        << "  spt_bench server --cert CERT --key KEY [--bind HOST] [--port N]\n"
+        << "  spt_bench server [--cert CERT --key KEY] [--bind HOST] [--port N]\n"
         << "      [--aead aes-128-gcm|aes-256-gcm|chacha20-poly1305]\n"
         << "      [--sockets N] [--workers N] [--protection confidential|authenticated]\n"
         << "      [--send FILE] [--recv FILE] [--bytes SIZE] [--seconds SEC]\n"
         << "      [--hash] [--csv FILE] [--no-chart]\n"
-        << "  spt_bench client HOST PORT --cert CERT --key KEY [same options]\n"
+        << "  spt_bench client HOST PORT [--cert CERT --key KEY] [same options]\n"
         << "  spt_bench suite --cert CERT --key KEY [--bytes SIZE] [--sockets 1,4,8]\n"
         << "      [--workers N] [--seconds SEC] [--csv FILE] [--no-chart]\n"
         << "\n"
@@ -257,7 +267,10 @@ void usage()
         << "Omit --bytes, --seconds, and --send to receive only. --seconds alone sends\n"
         << "generated data until the timer. A client with none of those, and no --recv,\n"
         << "sends generated data until Ctrl-C. Ctrl-C ends the transmit cleanly; a second\n"
-        << "Ctrl-C exits immediately.\n";
+        << "Ctrl-C exits immediately.\n"
+        << "The server always has a certificate. Without --cert and --key it writes a\n"
+        << "self-signed one. A client certificate is optional; without one, the client\n"
+        << "still encrypts to the server certificate and does not present its own.\n";
 }
 
 config parse_args(int argc, char **argv, std::vector<std::string> &positionals)
@@ -317,14 +330,178 @@ void require_tls(const config &cfg)
         throw std::runtime_error("--cert and --key are required");
 }
 
-parsock::options make_options(const config &cfg, const std::string &server_name)
+[[noreturn]] void tls_fail(const char *what)
+{
+    char buf[256] = {};
+    const unsigned long err = ERR_get_error();
+    if (err != 0)
+        ERR_error_string_n(err, buf, sizeof(buf));
+    throw std::runtime_error(std::string(what) + (buf[0] ? std::string(": ") + buf : std::string()));
+}
+
+bool is_wildcard_bind(const std::string &host)
+{
+    return host.empty() || host == "0.0.0.0" || host == "::" || host == "*";
+}
+
+bool is_ip_literal(const std::string &host)
+{
+    unsigned char buf[16];
+    return inet_pton(AF_INET, host.c_str(), buf) == 1 || inet_pton(AF_INET6, host.c_str(), buf) == 1;
+}
+
+void add_unique(std::vector<std::string> &names, const std::string &entry)
+{
+    if (std::find(names.begin(), names.end(), entry) == names.end())
+        names.push_back(entry);
+}
+
+std::string certificate_names(const std::string &bind_host)
+{
+    std::vector<std::string> names;
+    add_unique(names, "DNS:localhost");
+    add_unique(names, "IP:127.0.0.1");
+    add_unique(names, "IP:::1");
+    char host[256];
+    if (gethostname(host, sizeof(host)) == 0) {
+        host[sizeof(host) - 1] = '\0';
+        if (host[0] != '\0' && std::strcmp(host, "localhost") != 0)
+            add_unique(names, std::string("DNS:") + host);
+    }
+    if (!is_wildcard_bind(bind_host))
+        add_unique(names, (is_ip_literal(bind_host) ? "IP:" : "DNS:") + bind_host);
+    struct ifaddrs *list = nullptr;
+    if (getifaddrs(&list) == 0) {
+        for (struct ifaddrs *ifa = list; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr)
+                continue;
+            char text[INET6_ADDRSTRLEN];
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                const auto *addr = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr);
+                if (inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text)) != nullptr)
+                    add_unique(names, std::string("IP:") + text);
+            } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+                const auto *addr = reinterpret_cast<const struct sockaddr_in6 *>(ifa->ifa_addr);
+                if (inet_ntop(AF_INET6, &addr->sin6_addr, text, sizeof(text)) != nullptr)
+                    add_unique(names, std::string("IP:") + text);
+            }
+        }
+        freeifaddrs(list);
+    }
+    std::string joined;
+    for (const std::string &name : names) {
+        if (!joined.empty())
+            joined += ',';
+        joined += name;
+    }
+    return joined;
+}
+
+struct ephemeral_cert {
+    std::filesystem::path cert;
+    std::filesystem::path key;
+
+    ephemeral_cert() = default;
+    ephemeral_cert(const ephemeral_cert &) = delete;
+    ephemeral_cert &operator=(const ephemeral_cert &) = delete;
+    ephemeral_cert(ephemeral_cert &&other) noexcept : cert(std::move(other.cert)), key(std::move(other.key))
+    {
+        other.cert.clear();
+        other.key.clear();
+    }
+    ephemeral_cert &operator=(ephemeral_cert &&other) noexcept
+    {
+        if (this != &other) {
+            remove();
+            cert = std::move(other.cert);
+            key = std::move(other.key);
+            other.cert.clear();
+            other.key.clear();
+        }
+        return *this;
+    }
+    ~ephemeral_cert() { remove(); }
+
+    void remove() noexcept
+    {
+        std::error_code ec;
+        if (!cert.empty())
+            std::filesystem::remove(cert, ec);
+        if (!key.empty())
+            std::filesystem::remove(key, ec);
+    }
+};
+
+ephemeral_cert make_ephemeral_cert(const std::string &bind_host)
+{
+    const auto dir = std::filesystem::temp_directory_path();
+    const std::string stamp = std::to_string(static_cast<long long>(getpid()));
+    ephemeral_cert files;
+    files.cert = dir / ("spt-bench-" + stamp + "-cert.pem");
+    files.key = dir / ("spt-bench-" + stamp + "-key.pem");
+
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> kctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr),
+                                                                     EVP_PKEY_CTX_free);
+    EVP_PKEY *raw_key = nullptr;
+    if (!kctx || EVP_PKEY_keygen_init(kctx.get()) != 1 || EVP_PKEY_CTX_set_rsa_keygen_bits(kctx.get(), 2048) != 1 ||
+        EVP_PKEY_keygen(kctx.get(), &raw_key) != 1)
+        tls_fail("certificate key");
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(raw_key, EVP_PKEY_free);
+
+    std::unique_ptr<X509, decltype(&X509_free)> cert(X509_new(), X509_free);
+    if (!cert)
+        tls_fail("certificate");
+    if (X509_set_version(cert.get(), 2) != 1 || ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1) != 1 ||
+        X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0) == nullptr ||
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), 60 * 60 * 24 * 365) == nullptr ||
+        X509_set_pubkey(cert.get(), key.get()) != 1)
+        tls_fail("certificate");
+    X509_NAME *name = X509_get_subject_name(cert.get());
+    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char *>("localhost"), -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert.get(), name) != 1)
+        tls_fail("certificate name");
+
+    const std::string names = certificate_names(bind_host);
+    X509V3_CTX ext;
+    X509V3_set_ctx_nodb(&ext);
+    X509V3_set_ctx(&ext, cert.get(), cert.get(), nullptr, nullptr, 0);
+    std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san(
+        X509V3_EXT_conf_nid(nullptr, &ext, NID_subject_alt_name, names.c_str()), X509_EXTENSION_free);
+    std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> basic(
+        X509V3_EXT_conf_nid(nullptr, &ext, NID_basic_constraints, "critical,CA:TRUE"), X509_EXTENSION_free);
+    if (!san || !basic || X509_add_ext(cert.get(), basic.get(), -1) != 1 ||
+        X509_add_ext(cert.get(), san.get(), -1) != 1 || X509_sign(cert.get(), key.get(), EVP_sha256()) == 0)
+        tls_fail("certificate extensions");
+
+    std::unique_ptr<BIO, decltype(&BIO_free)> cert_bio(BIO_new_file(files.cert.c_str(), "w"), BIO_free);
+    std::unique_ptr<BIO, decltype(&BIO_free)> key_bio(BIO_new_file(files.key.c_str(), "w"), BIO_free);
+    if (!cert_bio || !key_bio || PEM_write_bio_X509(cert_bio.get(), cert.get()) != 1 ||
+        PEM_write_bio_PrivateKey(key_bio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) != 1)
+        tls_fail("writing certificate");
+    cert_bio.reset();
+    key_bio.reset();
+    chmod(files.key.c_str(), S_IRUSR | S_IWUSR);
+
+    std::cerr << "generated self-signed certificate\n"
+              << "  cert " << files.cert.string() << "\n"
+              << "  key  " << files.key.string() << "\n";
+    return files;
+}
+
+enum class tls_use { mutual, server, client };
+
+parsock::options make_options(const config &cfg, const std::string &server_name, tls_use use = tls_use::mutual)
 {
     parsock::options opt;
-    opt.certificate(cfg.cert)
-        .private_key(cfg.key)
-        .ca_file(cfg.cert)
-        .verify_peer(true)
-        .sockets(cfg.sockets)
+    if (use == tls_use::client && cfg.cert.empty() && cfg.key.empty()) {
+        opt.verify_peer(false).allow_insecure(true);
+    } else if (use == tls_use::server) {
+        opt.certificate(cfg.cert).private_key(cfg.key).verify_peer(false);
+    } else {
+        opt.certificate(cfg.cert).private_key(cfg.key).ca_file(cfg.cert).verify_peer(true);
+    }
+    opt.sockets(cfg.sockets)
         .workers(cfg.workers)
         .cipher(cfg.cipher)
         .minimum_protection(cfg.protection)
@@ -808,7 +985,10 @@ std::string endpoint_title(const std::string &host, std::uint16_t port)
 
 int run_endpoint(config cfg, bool server, const std::vector<std::string> &positionals)
 {
-    require_tls(cfg);
+    if (server)
+        require_tls(cfg);
+    else if (cfg.cert.empty() != cfg.key.empty())
+        throw std::runtime_error("client --cert and --key must be set together");
     if (cfg.socket_list.size() > 1)
         throw std::runtime_error("a socket list belongs on spt_bench suite");
     std::ofstream csv;
@@ -830,7 +1010,7 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
     if (server) {
         if (!positionals.empty())
             throw std::runtime_error("server takes no positional arguments");
-        parsock::options opt = make_options(cfg, "");
+        parsock::options opt = make_options(cfg, "", tls_use::server);
         parsock::listener listener = parsock::listener::listen(cfg.bind_host, cfg.port, opt);
         const parsock::endpoints ports = listener.ports();
         std::cerr << "listening " << cfg.bind_host << ":" << ports.control << "  " << aead_name(cfg.cipher)
@@ -846,7 +1026,7 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
         throw std::runtime_error("client requires HOST PORT");
     cfg.host = positionals[0];
     cfg.port = parse_port(positionals[1]);
-    parsock::options opt = make_options(cfg, cfg.host);
+    parsock::options opt = make_options(cfg, cfg.host, tls_use::client);
     parsock::connection conn = parsock::connection::connect(cfg.host, cfg.port, opt);
     const summary result = run_transfer(conn, cfg, endpoint_title(cfg.host, cfg.port), chart_on, interval_stdout,
                                          csv.is_open() ? &csv : nullptr);
@@ -1060,8 +1240,15 @@ int main(int argc, char **argv)
         }
         std::vector<std::string> positionals;
         config cfg = parse_args(argc, argv, positionals);
-        if (mode == "server")
+        std::optional<ephemeral_cert> generated;
+        if (mode == "server") {
+            if (cfg.cert.empty() && cfg.key.empty()) {
+                generated = make_ephemeral_cert(cfg.bind_host);
+                cfg.cert = generated->cert.string();
+                cfg.key = generated->key.string();
+            }
             return run_endpoint(std::move(cfg), true, positionals);
+        }
         if (mode == "client")
             return run_endpoint(std::move(cfg), false, positionals);
         if (mode == "suite") {
