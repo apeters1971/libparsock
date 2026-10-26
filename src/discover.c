@@ -15,10 +15,6 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 
-#if defined(__linux__)
-#include <linux/tcp.h>
-#endif
-
 static void copy_name(char *dst, size_t cap, const char *src)
 {
     if (!dst || cap == 0)
