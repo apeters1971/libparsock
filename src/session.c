@@ -680,7 +680,6 @@ static void finish_job_locked(struct ps_session *s, struct crypto_job *job, int 
             fail_locked(s, PS_ERR_CRYPTO);
         else if (job->sf)
             refresh_write_locked(s, job->sf);
-        pthread_cond_broadcast(&s->cv);
     }
 }
 
@@ -2590,7 +2589,8 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
     }
     if (session->rx_hold)
         session->rx_hold--;
-    pthread_cond_broadcast(&session->cv);
+    if (session->closing || session->state == PS_STATE_CLOSED)
+        pthread_cond_broadcast(&session->cv);
     int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
     unlock_s(session);
     return err ? -err : PS_OK;
@@ -2690,12 +2690,14 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
                 frame_put_locked(session, slot->frame, slot->len);
                 free(slot);
                 try_end_locked(session, sf);
-                pthread_cond_broadcast(&session->cv);
+                if (session->send_stalled)
+                    pthread_cond_broadcast(&session->cv);
             }
         }
         if (session->send_hold)
             session->send_hold--;
-        pthread_cond_broadcast(&session->cv);
+        if (session->closing || session->state == PS_STATE_CLOSED)
+            pthread_cond_broadcast(&session->cv);
         refresh_write_locked(session, sf);
         sent += (size_t)wr;
         unlock_s(session);
@@ -2919,12 +2921,12 @@ ssize_t ps_session_send_wait(ps_session_t *session, const void *buf, size_t len,
         if (failed)
             fatal = session->err ? session->err : PS_ERR_PROTO;
         unlock_s(session);
-        ps_session_progress_step(session);
         if (n > 0) {
             p += n;
             left -= n;
             continue;
         }
+        ps_session_progress_step(session);
         if (failed || (err != PS_ERR_AGAIN && err != PS_OK)) {
             fatal = fatal ? fatal : err;
             break;

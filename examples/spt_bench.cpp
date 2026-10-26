@@ -36,7 +36,7 @@
 
 namespace {
 
-constexpr std::size_t kChunk = 256 * 1024;
+constexpr std::size_t kChunk = 1024 * 1024;
 constexpr std::size_t kFrame = 256 * 1024;
 constexpr std::uint64_t kUntilEof = UINT64_MAX;
 constexpr std::uint8_t kFlagPattern = 1;
@@ -707,7 +707,7 @@ void send_direction(parsock::connection &conn, const config &cfg, meter &stats, 
                 chunk = static_cast<std::size_t>(planned - sent);
             if (from_file)
                 read_exact(file, reinterpret_cast<char *>(buf.data()), chunk, cfg.send_path);
-            else {
+            else if (cfg.verify) {
                 fill_pattern(buf.data(), sent, chunk);
             }
             mark_start(stats.tx_start_ns);
