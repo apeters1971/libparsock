@@ -9,6 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(APPLE AND EXISTS "/opt/homebrew/opt/openssl@3")
     set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3" CACHE PATH "OpenSSL 3 prefix" FORCE)
+elseif(APPLE AND EXISTS "/usr/local/opt/openssl@3")
+    set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl@3" CACHE PATH "OpenSSL 3 prefix" FORCE)
 endif()
 
 find_package(OpenSSL 3.0 REQUIRED)
