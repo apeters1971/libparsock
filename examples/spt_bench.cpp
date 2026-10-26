@@ -543,45 +543,47 @@ inline std::uint8_t pattern_byte(std::uint64_t offset)
     return static_cast<std::uint8_t>((offset * 131u) ^ (offset >> 8));
 }
 
+struct pattern_table {
+    alignas(64) std::uint8_t bytes[65536 * 2];
+    pattern_table()
+    {
+        for (std::size_t i = 0; i < sizeof(bytes); i++)
+            bytes[i] = pattern_byte(i);
+    }
+};
+
+const pattern_table &global_pattern()
+{
+    static const pattern_table table;
+    return table;
+}
+
 void fill_pattern(std::uint8_t *dst, std::uint64_t offset, std::size_t n)
 {
-    std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        dst[i] = pattern_byte(offset + i);
-        dst[i + 1] = pattern_byte(offset + i + 1);
-        dst[i + 2] = pattern_byte(offset + i + 2);
-        dst[i + 3] = pattern_byte(offset + i + 3);
-        dst[i + 4] = pattern_byte(offset + i + 4);
-        dst[i + 5] = pattern_byte(offset + i + 5);
-        dst[i + 6] = pattern_byte(offset + i + 6);
-        dst[i + 7] = pattern_byte(offset + i + 7);
+    const auto &table = global_pattern();
+    std::size_t done = 0;
+    while (done < n) {
+        const std::size_t phase = static_cast<std::size_t>((offset + done) & 0xffffu);
+        std::size_t step = 65536;
+        if (step > n - done)
+            step = n - done;
+        std::memcpy(dst + done, table.bytes + phase, step);
+        done += step;
     }
-    for (; i < n; i++)
-        dst[i] = pattern_byte(offset + i);
 }
 
 bool pattern_matches(const std::uint8_t *src, std::uint64_t offset, std::size_t n)
 {
-    std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        std::uint64_t exp = 0;
-        std::uint8_t *p = reinterpret_cast<std::uint8_t *>(&exp);
-        p[0] = pattern_byte(offset + i);
-        p[1] = pattern_byte(offset + i + 1);
-        p[2] = pattern_byte(offset + i + 2);
-        p[3] = pattern_byte(offset + i + 3);
-        p[4] = pattern_byte(offset + i + 4);
-        p[5] = pattern_byte(offset + i + 5);
-        p[6] = pattern_byte(offset + i + 6);
-        p[7] = pattern_byte(offset + i + 7);
-        std::uint64_t act = 0;
-        std::memcpy(&act, src + i, 8);
-        if (act != exp)
+    const auto &table = global_pattern();
+    std::size_t done = 0;
+    while (done < n) {
+        const std::size_t phase = static_cast<std::size_t>((offset + done) & 0xffffu);
+        std::size_t step = 65536;
+        if (step > n - done)
+            step = n - done;
+        if (std::memcmp(src + done, table.bytes + phase, step) != 0)
             return false;
-    }
-    for (; i < n; i++) {
-        if (src[i] != pattern_byte(offset + i))
-            return false;
+        done += step;
     }
     return true;
 }
@@ -695,6 +697,8 @@ void send_direction(parsock::connection &conn, const config &cfg, meter &stats, 
         conn.send(header, sizeof(header), parsock::protection::confidential);
 
         std::vector<std::uint8_t> buf(kChunk);
+        if (!from_file && cfg.verify)
+            fill_pattern(buf.data(), 0, buf.size());
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                   std::chrono::duration<double>(cfg.seconds));
@@ -707,7 +711,7 @@ void send_direction(parsock::connection &conn, const config &cfg, meter &stats, 
                 chunk = static_cast<std::size_t>(planned - sent);
             if (from_file)
                 read_exact(file, reinterpret_cast<char *>(buf.data()), chunk, cfg.send_path);
-            else if (cfg.verify) {
+            else if (cfg.verify && (sent & 0xffffu) != 0) {
                 fill_pattern(buf.data(), sent, chunk);
             }
             mark_start(stats.tx_start_ns);
