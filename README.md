@@ -16,6 +16,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+The default build type is Release. An existing `build` directory configured without a build type stays unoptimized until it is reconfigured with `-DCMAKE_BUILD_TYPE=Release`. That unoptimized build caps the transfer around a few Gb/s on one thread, so extra sockets do not add rate.
+
 The CMake build looks for Homebrew OpenSSL 3 on Apple automatically when that prefix exists. AddressSanitizer:
 
 ```sh
