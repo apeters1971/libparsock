@@ -257,7 +257,7 @@ static void *runtime_main(void *arg)
             watches[np - 1] = watches[i];
             np++;
         }
-        int timeout = ps_session_next_timeout_ms(rt->session);
+        int timeout = lane->index == 0 ? ps_session_next_timeout_ms(rt->session) : 1000;
         int pr = poll(pfds, (nfds_t)np, timeout);
         if (rt->stop)
             break;
