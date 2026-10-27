@@ -455,6 +455,17 @@ static int cid_eq(const ngtcp2_cid *cid, const uint8_t *data, size_t len)
     return cid->datalen == len && memcmp(cid->data, data, len) == 0;
 }
 
+/* ngtcp2 1.23 renamed this. 1.22, which EPEL 9 ships, still has the old name
+   with the same NULL-means-count behavior. */
+static size_t conn_scids(ngtcp2_conn *conn, ngtcp2_cid *dest)
+{
+#if NGTCP2_VERSION_NUM >= 0x011700
+    return ngtcp2_conn_get_scid2(conn, dest);
+#else
+    return ngtcp2_conn_get_scid(conn, dest);
+#endif
+}
+
 static int conn_matches(struct qconn *c, const uint8_t *dcid, size_t dcidlen)
 {
     if (!c->used || !c->conn || c->dead)
@@ -462,12 +473,12 @@ static int conn_matches(struct qconn *c, const uint8_t *dcid, size_t dcidlen)
     if (c->have_odcid && cid_eq(&c->original_dcid, dcid, dcidlen))
         return 1;
     ngtcp2_cid scids[8];
-    size_t n = ngtcp2_conn_get_scid2(c->conn, NULL);
+    size_t n = conn_scids(c->conn, NULL);
     if (n > 8)
         n = 8;
     if (n == 0)
         return 0;
-    n = ngtcp2_conn_get_scid2(c->conn, scids);
+    n = conn_scids(c->conn, scids);
     if (n > 8)
         n = 8;
     for (size_t i = 0; i < n; i++) {
