@@ -1,9 +1,23 @@
+#define _GNU_SOURCE
+
 #include "parsock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static uint64_t now_ms(void)
 {
@@ -17,7 +31,179 @@ static void usage(void)
     fprintf(stderr,
             "usage:\n"
             "  spt_http server cert key [port] [public]\n"
-            "  spt_http client cert key host port bytes [public]\n");
+            "  spt_http client cert key host port bytes [public]\n"
+            "A missing server certificate and key are written as a self-signed pair.\n");
+}
+
+static void openssl_fail(const char *what)
+{
+    fprintf(stderr, "spt_http: %s\n", what);
+    unsigned long err;
+    while ((err = ERR_get_error()) != 0) {
+        char buf[256];
+        ERR_error_string_n(err, buf, sizeof(buf));
+        fprintf(stderr, "spt_http: %s\n", buf);
+    }
+}
+
+static int san_has(const char *list, const char *name)
+{
+    size_t nlen = strlen(name);
+    const char *p = list;
+    while (*p) {
+        if (strncmp(p, name, nlen) == 0 && (p[nlen] == ',' || p[nlen] == '\0') &&
+            (p == list || p[-1] == ','))
+            return 1;
+        p = strchr(p, ',');
+        if (!p)
+            break;
+        p++;
+    }
+    return 0;
+}
+
+static int san_add(char *list, size_t cap, const char *name)
+{
+    if (!name || !name[0] || san_has(list, name))
+        return 0;
+    size_t cur = strlen(list);
+    size_t nlen = strlen(name);
+    size_t extra = nlen + (cur ? 1 : 0);
+    if (cur + extra + 1 > cap)
+        return -1;
+    if (cur)
+        list[cur++] = ',';
+    memcpy(list + cur, name, nlen + 1);
+    return 0;
+}
+
+static int certificate_names(char *list, size_t cap)
+{
+    list[0] = '\0';
+    if (san_add(list, cap, "DNS:localhost") != 0 || san_add(list, cap, "IP:127.0.0.1") != 0 ||
+        san_add(list, cap, "IP:::1") != 0)
+        return -1;
+    char host[256];
+    if (gethostname(host, sizeof(host)) == 0) {
+        host[sizeof(host) - 1] = '\0';
+        char dns[300];
+        snprintf(dns, sizeof(dns), "DNS:%s", host);
+        if (strcmp(host, "localhost") != 0 && san_add(list, cap, dns) != 0)
+            return -1;
+    }
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) != 0)
+        return 0;
+    for (struct ifaddrs *ifa = ifs; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr)
+            continue;
+        char text[INET6_ADDRSTRLEN];
+        char name[INET6_ADDRSTRLEN + 4];
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            const struct sockaddr_in *addr = (const struct sockaddr_in *)ifa->ifa_addr;
+            if (!inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text)))
+                continue;
+        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+            const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *)ifa->ifa_addr;
+            if (!inet_ntop(AF_INET6, &addr->sin6_addr, text, sizeof(text)))
+                continue;
+        } else {
+            continue;
+        }
+        snprintf(name, sizeof(name), "IP:%s", text);
+        if (san_add(list, cap, name) != 0) {
+            freeifaddrs(ifs);
+            return -1;
+        }
+    }
+    freeifaddrs(ifs);
+    return 0;
+}
+
+static int write_self_signed(const char *cert_path, const char *key_path)
+{
+    char names[4096];
+    EVP_PKEY_CTX *kctx = NULL;
+    EVP_PKEY *key = NULL;
+    X509 *cert = NULL;
+    BIO *cert_bio = NULL;
+    BIO *key_bio = NULL;
+    X509_EXTENSION *san = NULL;
+    X509_EXTENSION *basic = NULL;
+    int rc = -1;
+
+    if (certificate_names(names, sizeof(names)) != 0) {
+        fprintf(stderr, "spt_http: certificate name list is too long\n");
+        return -1;
+    }
+    kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!kctx || EVP_PKEY_keygen_init(kctx) != 1 || EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) != 1 ||
+        EVP_PKEY_keygen(kctx, &key) != 1) {
+        openssl_fail("certificate key");
+        goto done;
+    }
+    cert = X509_new();
+    if (!cert || X509_set_version(cert, 2) != 1 || ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) != 1 ||
+        !X509_gmtime_adj(X509_getm_notBefore(cert), 0) ||
+        !X509_gmtime_adj(X509_getm_notAfter(cert), 60 * 60 * 24 * 365) || X509_set_pubkey(cert, key) != 1) {
+        openssl_fail("certificate");
+        goto done;
+    }
+    X509_NAME *name = X509_get_subject_name(cert);
+    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"localhost", -1, -1,
+                                   0) != 1 ||
+        X509_set_issuer_name(cert, name) != 1) {
+        openssl_fail("certificate name");
+        goto done;
+    }
+    X509V3_CTX ext;
+    X509V3_set_ctx_nodb(&ext);
+    X509V3_set_ctx(&ext, cert, cert, NULL, NULL, 0);
+    san = X509V3_EXT_conf_nid(NULL, &ext, NID_subject_alt_name, names);
+    basic = X509V3_EXT_conf_nid(NULL, &ext, NID_basic_constraints, "critical,CA:TRUE");
+    if (!san || !basic || X509_add_ext(cert, basic, -1) != 1 || X509_add_ext(cert, san, -1) != 1 ||
+        X509_sign(cert, key, EVP_sha256()) == 0) {
+        openssl_fail("certificate extensions");
+        goto done;
+    }
+    cert_bio = BIO_new_file(cert_path, "w");
+    key_bio = BIO_new_file(key_path, "w");
+    if (!cert_bio || !key_bio || PEM_write_bio_X509(cert_bio, cert) != 1 ||
+        PEM_write_bio_PrivateKey(key_bio, key, NULL, NULL, 0, NULL, NULL) != 1) {
+        openssl_fail("writing certificate");
+        unlink(cert_path);
+        unlink(key_path);
+        goto done;
+    }
+    BIO_free(cert_bio);
+    BIO_free(key_bio);
+    cert_bio = NULL;
+    key_bio = NULL;
+    chmod(key_path, S_IRUSR | S_IWUSR);
+    fprintf(stderr, "generated self-signed certificate\n  cert %s\n  key  %s\n", cert_path, key_path);
+    rc = 0;
+done:
+    X509_EXTENSION_free(san);
+    X509_EXTENSION_free(basic);
+    BIO_free(cert_bio);
+    BIO_free(key_bio);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    EVP_PKEY_CTX_free(kctx);
+    return rc;
+}
+
+static int ensure_server_cert(const char *cert_path, const char *key_path)
+{
+    int have_cert = access(cert_path, R_OK) == 0;
+    int have_key = access(key_path, R_OK) == 0;
+    if (have_cert && have_key)
+        return 0;
+    if (have_cert != have_key) {
+        fprintf(stderr, "spt_http: %s is missing\n", have_cert ? key_path : cert_path);
+        return -1;
+    }
+    return write_self_signed(cert_path, key_path);
 }
 
 static uint8_t body_byte(size_t off)
@@ -45,8 +231,10 @@ static int read_headers(ps_connection_t *conn, char *buf, size_t cap, size_t *us
 static int run_server(struct ps_options *opt, uint16_t port)
 {
     ps_listener_t *ln = ps_listen(port ? "0.0.0.0" : "127.0.0.1", port, opt);
-    if (!ln)
+    if (!ln) {
+        fprintf(stderr, "spt_http: listen failed\n");
         return 1;
+    }
     uint16_t bound = 0;
     ps_listener_port(ln, &bound, NULL);
     printf("listening %u\n", (unsigned)bound);
@@ -183,6 +371,8 @@ int main(int argc, char **argv)
             port = (uint16_t)atoi(argv[4]);
         if (public_body)
             opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+        if (ensure_server_cert(argv[2], argv[3]) != 0)
+            return 1;
         return run_server(&opt, port);
     }
     if (strcmp(argv[1], "client") == 0) {
@@ -192,6 +382,10 @@ int main(int argc, char **argv)
         }
         if (argc > 7 && strcmp(argv[7], "public") == 0)
             opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+        if (access(argv[2], R_OK) != 0 || access(argv[3], R_OK) != 0) {
+            fprintf(stderr, "spt_http: certificate %s or key %s is missing\n", argv[2], argv[3]);
+            return 1;
+        }
         tls.server_name = argv[4];
         return run_client(&opt, argv[4], (uint16_t)atoi(argv[5]), strtoull(argv[6], NULL, 10));
     }
