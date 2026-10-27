@@ -140,6 +140,7 @@ struct subflow {
     int drain;
     int end_sent;
     int end_recv;
+    int peer_eof;
     int counted_active;
     int keys_ready;
     int server_nonce_set;
@@ -751,7 +752,8 @@ static void finish_job_locked(struct ps_session *s, struct crypto_job *job, int 
         if (ok != 0)
             fail_locked(s, PS_ERR_CRYPTO);
         if (job->sf && job->sf->read_paused && job->sf->in_flight <= RX_PIPELINE / 2 &&
-            job->sf->state != SF_RETIRED && (job->sf->fd >= 0 || job->sf->rdma)) {
+            job->sf->state != SF_RETIRED && !job->sf->peer_eof &&
+            (job->sf->fd >= 0 || job->sf->rdma)) {
             job->sf->read_paused = 0;
             job->sf->want_read = 1;
             if (job->sf->fd >= 0)
@@ -2915,15 +2917,29 @@ int ps_session_control_plaintext(ps_session_t *session, const uint8_t *data, siz
     return err ? -err : PS_OK;
 }
 
+static int tcp_data_pending(const struct ps_session *s)
+{
+    for (uint32_t i = 0; i < s->sf_count; i++) {
+        const struct subflow *sf = &s->sf[i];
+        if (!sf->used || sf->rdma || sf->state == SF_UNUSED || sf->state == SF_RETIRED)
+            continue;
+        if (!sf->peer_eof)
+            return 1;
+    }
+    return 0;
+}
+
 void ps_session_control_eof(ps_session_t *session)
 {
     if (!session)
         return;
     lock_s(session);
-    if (session->state == PS_STATE_OPEN && !session->got_eos)
-        fail_locked(session, PS_ERR_CLOSED);
-    else if (session->state != PS_STATE_FAILED)
-        session->state = PS_STATE_CLOSED;
+    if (session->state != PS_STATE_FAILED) {
+        if (session->got_eos)
+            session->state = PS_STATE_CLOSED;
+        else if (!tcp_data_pending(session))
+            fail_locked(session, PS_ERR_CLOSED);
+    }
     pthread_cond_broadcast(&session->cv);
     unlock_s(session);
 }
@@ -3087,10 +3103,16 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
             break;
         }
         if (n == 0) {
-            if (sf->end_recv || sf->state == SF_RETIRED || session->closing || session->got_eos)
-                sf->close_pending = 1;
-            else
+            if (rx_live(sf) > 0) {
                 fail_locked(session, PS_ERR_IO);
+                break;
+            }
+            sf->peer_eof = 1;
+            sf->want_read = 0;
+            if (sf->fd >= 0)
+                queue_io(session, sf->fd, 0, sf->want_write);
+            if (!session->got_eos && !session->closing && !tcp_data_pending(session))
+                fail_locked(session, PS_ERR_CLOSED);
             break;
         }
         sf->rx_len += (size_t)n;

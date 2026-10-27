@@ -7,8 +7,24 @@
 #include <unistd.h>
 
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <sys/socket.h>
+
+static int tls_peer_closed(int n, int err)
+{
+    if (n == 0 || err == SSL_ERROR_ZERO_RETURN)
+        return 1;
+    if (err == SSL_ERROR_SYSCALL &&
+        (errno == 0 || errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN ||
+         errno == ECONNABORTED))
+        return 1;
+    if (err == SSL_ERROR_SSL && ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        ERR_clear_error();
+        return 1;
+    }
+    return 0;
+}
 
 static int pump_control(ps_session_t *session)
 {
@@ -32,6 +48,7 @@ static int pump_control(ps_session_t *session)
         }
     }
 
+    int peer_closed = 0;
     for (int i = 0; i < 32; i++) {
         uint8_t buf[16384];
         int n = SSL_read(ssl, buf, (int)sizeof(buf));
@@ -44,15 +61,18 @@ static int pump_control(ps_session_t *session)
         int err = SSL_get_error(ssl, n);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             break;
-        if (err == SSL_ERROR_ZERO_RETURN || n == 0 ||
-            (err == SSL_ERROR_SYSCALL &&
-             (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN))) {
+        if (tls_peer_closed(n, err)) {
             ps_session_control_eof(session);
+            peer_closed = 1;
             break;
         }
         ps_tls_log_errors("SSL_read");
         ps_session_fail(session, PS_ERR_TLS);
         return -PS_ERR_TLS;
+    }
+    if (peer_closed) {
+        ps_session_set_ctrl_want(session, 0, 0);
+        return PS_OK;
     }
 
     uint8_t context[96];
@@ -83,11 +103,10 @@ static int pump_control(ps_session_t *session)
             want_write = 1;
             break;
         }
-        if (err == SSL_ERROR_ZERO_RETURN ||
-            (err == SSL_ERROR_SYSCALL &&
-             (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN))) {
+        if (tls_peer_closed(n, err)) {
             ps_session_control_eof(session);
-            break;
+            ps_session_set_ctrl_want(session, 0, 0);
+            return PS_OK;
         }
         ps_tls_log_errors("SSL_write");
         ps_session_fail(session, PS_ERR_TLS);

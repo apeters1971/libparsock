@@ -15,6 +15,7 @@
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -77,6 +78,27 @@ static int san_add(char *list, size_t cap, const char *name)
     return 0;
 }
 
+static int add_dns_name(char *list, size_t cap, const char *host)
+{
+    if (!host || !host[0] || strcmp(host, "localhost") == 0)
+        return 0;
+    char dns[300];
+    snprintf(dns, sizeof(dns), "DNS:%s", host);
+    if (san_add(list, cap, dns) != 0)
+        return -1;
+    const char *dot = strchr(host, '.');
+    if (!dot || dot == host || !dot[1])
+        return 0;
+    char short_name[256];
+    size_t n = (size_t)(dot - host);
+    if (n >= sizeof(short_name))
+        return -1;
+    memcpy(short_name, host, n);
+    short_name[n] = '\0';
+    snprintf(dns, sizeof(dns), "DNS:%s", short_name);
+    return san_add(list, cap, dns);
+}
+
 static int certificate_names(char *list, size_t cap)
 {
     list[0] = '\0';
@@ -84,12 +106,24 @@ static int certificate_names(char *list, size_t cap)
         san_add(list, cap, "IP:::1") != 0)
         return -1;
     char host[256];
+    host[0] = '\0';
     if (gethostname(host, sizeof(host)) == 0) {
         host[sizeof(host) - 1] = '\0';
-        char dns[300];
-        snprintf(dns, sizeof(dns), "DNS:%s", host);
-        if (strcmp(host, "localhost") != 0 && san_add(list, cap, dns) != 0)
+        if (add_dns_name(list, cap, host) != 0)
             return -1;
+    }
+    if (host[0]) {
+        struct addrinfo hints;
+        struct addrinfo *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_flags = AI_CANONNAME;
+        if (getaddrinfo(host, NULL, &hints, &res) == 0) {
+            int arc = res->ai_canonname ? add_dns_name(list, cap, res->ai_canonname) : 0;
+            freeaddrinfo(res);
+            if (arc != 0)
+                return -1;
+        }
     }
     struct ifaddrs *ifs = NULL;
     if (getifaddrs(&ifs) != 0)
@@ -239,65 +273,69 @@ static int run_server(struct ps_options *opt, uint16_t port)
     ps_listener_port(ln, &bound, NULL);
     printf("listening %u\n", (unsigned)bound);
     fflush(stdout);
-    ps_connection_t *conn = ps_accept(ln);
-    if (!conn) {
-        ps_listener_close(ln);
-        return 1;
-    }
-    char hdr[2048];
-    size_t hlen = 0;
-    if (read_headers(conn, hdr, sizeof(hdr), &hlen) != 0) {
-        ps_close(conn);
-        ps_listener_close(ln);
-        return 1;
-    }
-    unsigned long long nbytes = 1024ull * 1024ull;
-    if (strncmp(hdr, "GET /", 5) == 0)
-        nbytes = strtoull(hdr + 5, NULL, 10);
-    if (nbytes == 0)
-        nbytes = 1024ull * 1024ull;
-    char resp[256];
-    int rn = snprintf(resp, sizeof(resp),
-                      "HTTP/1.1 200 OK\r\n"
-                      "Content-Length: %llu\r\n"
-                      "Content-Type: application/octet-stream\r\n"
-                      "Connection: close\r\n"
-                      "\r\n",
-                      nbytes);
-    if (ps_send(conn, resp, (size_t)rn) != rn) {
-        ps_close(conn);
-        ps_listener_close(ln);
-        return 1;
-    }
-    uint8_t buf[65536];
-    unsigned long long left = nbytes;
-    while (left) {
-        size_t chunk = sizeof(buf);
-        if ((unsigned long long)chunk > left)
-            chunk = (size_t)left;
-        for (size_t i = 0; i < chunk; i++)
-            buf[i] = body_byte((size_t)(nbytes - left) + i);
-        ssize_t n = opt->min_protection == PS_PROTECTION_AUTHENTICATED
-                        ? ps_send_protected(conn, buf, chunk, PS_PROTECTION_AUTHENTICATED)
-                        : ps_send(conn, buf, chunk);
-        if (n <= 0) {
-            ps_close(conn);
+    for (;;) {
+        ps_connection_t *conn = ps_accept(ln);
+        if (!conn) {
             ps_listener_close(ln);
             return 1;
         }
-        left -= (unsigned long long)n;
+        char hdr[2048];
+        size_t hlen = 0;
+        if (read_headers(conn, hdr, sizeof(hdr), &hlen) != 0) {
+            fprintf(stderr, "spt_http: request failed: %s\n", ps_strerror(ps_connection_error(conn)));
+            ps_close(conn);
+            continue;
+        }
+        unsigned long long nbytes = 1024ull * 1024ull;
+        if (strncmp(hdr, "GET /", 5) == 0)
+            nbytes = strtoull(hdr + 5, NULL, 10);
+        if (nbytes == 0)
+            nbytes = 1024ull * 1024ull;
+        char resp[256];
+        int rn = snprintf(resp, sizeof(resp),
+                          "HTTP/1.1 200 OK\r\n"
+                          "Content-Length: %llu\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "Connection: close\r\n"
+                          "\r\n",
+                          nbytes);
+        if (ps_send(conn, resp, (size_t)rn) != rn) {
+            fprintf(stderr, "spt_http: send failed: %s\n", ps_strerror(ps_connection_error(conn)));
+            ps_close(conn);
+            continue;
+        }
+        uint8_t buf[65536];
+        unsigned long long left = nbytes;
+        int failed = 0;
+        while (left) {
+            size_t chunk = sizeof(buf);
+            if ((unsigned long long)chunk > left)
+                chunk = (size_t)left;
+            for (size_t i = 0; i < chunk; i++)
+                buf[i] = body_byte((size_t)(nbytes - left) + i);
+            ssize_t n = opt->min_protection == PS_PROTECTION_AUTHENTICATED
+                            ? ps_send_protected(conn, buf, chunk, PS_PROTECTION_AUTHENTICATED)
+                            : ps_send(conn, buf, chunk);
+            if (n <= 0) {
+                fprintf(stderr, "spt_http: send failed: %s\n", ps_strerror(ps_connection_error(conn)));
+                failed = 1;
+                break;
+            }
+            left -= (unsigned long long)n;
+        }
+        if (!failed)
+            ps_shutdown(conn, SHUT_WR);
+        ps_close(conn);
     }
-    ps_shutdown(conn, SHUT_WR);
-    ps_close(conn);
-    ps_listener_close(ln);
-    return 0;
 }
 
 static int run_client(struct ps_options *opt, const char *host, uint16_t port, unsigned long long nbytes)
 {
     ps_connection_t *conn = ps_connect(host, port, opt);
-    if (!conn)
+    if (!conn) {
+        fprintf(stderr, "spt_http: connect failed\n");
         return 1;
+    }
     char req[256];
     int rn = snprintf(req, sizeof(req),
                       "GET /%llu HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
@@ -323,7 +361,8 @@ static int run_client(struct ps_options *opt, const char *host, uint16_t port, u
     while (got < nbytes) {
         ssize_t n = ps_recv(conn, buf, sizeof(buf));
         if (n <= 0) {
-            fprintf(stderr, "short body %llu/%llu\n", got, nbytes);
+            fprintf(stderr, "short body %llu/%llu: %s\n", got, nbytes,
+                    ps_strerror(ps_connection_error(conn)));
             ps_close(conn);
             return 1;
         }

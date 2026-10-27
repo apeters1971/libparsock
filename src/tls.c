@@ -20,12 +20,12 @@ static int base_ctx(SSL_CTX *ctx)
 void ps_tls_log_errors(const char *what)
 {
     if (what)
-        ps_log("%s", what);
+        ps_notice("%s", what);
     unsigned long e;
     while ((e = ERR_get_error()) != 0) {
         char buf[256];
         ERR_error_string_n(e, buf, sizeof(buf));
-        ps_log("openssl: %s", buf);
+        ps_notice("openssl: %s", buf);
     }
 }
 
