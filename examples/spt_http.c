@@ -243,9 +243,53 @@ static int ensure_server_cert(const char *cert_path, const char *key_path)
     return write_self_signed(cert_path, key_path);
 }
 
-static uint8_t body_byte(size_t off)
+enum { kChunk = 2 * 1024 * 1024, kFrame = 256 * 1024 };
+
+static uint8_t pattern_byte(uint64_t offset)
 {
-    return (uint8_t)((off * 131u) ^ (off >> 8));
+    return (uint8_t)((offset * 131u) ^ (offset >> 8));
+}
+
+static const uint8_t *pattern_table(void)
+{
+    static uint8_t bytes[65536 * 2];
+    static int ready;
+    if (!ready) {
+        for (size_t i = 0; i < sizeof(bytes); i++)
+            bytes[i] = pattern_byte(i);
+        ready = 1;
+    }
+    return bytes;
+}
+
+static void fill_pattern(uint8_t *dst, uint64_t offset, size_t n)
+{
+    const uint8_t *table = pattern_table();
+    size_t done = 0;
+    while (done < n) {
+        size_t phase = (size_t)((offset + done) & 0xffffu);
+        size_t step = 65536;
+        if (step > n - done)
+            step = n - done;
+        memcpy(dst + done, table + phase, step);
+        done += step;
+    }
+}
+
+static int pattern_matches(const uint8_t *src, uint64_t offset, size_t n)
+{
+    const uint8_t *table = pattern_table();
+    size_t done = 0;
+    while (done < n) {
+        size_t phase = (size_t)((offset + done) & 0xffffu);
+        size_t step = 65536;
+        if (step > n - done)
+            step = n - done;
+        if (memcmp(src + done, table + phase, step) != 0)
+            return 0;
+        done += step;
+    }
+    return 1;
 }
 
 static int read_headers(ps_connection_t *conn, char *buf, size_t cap, size_t *used)
@@ -307,25 +351,40 @@ static int run_server(struct ps_options *opt, uint16_t port)
             ps_close(conn);
             continue;
         }
-        uint8_t buf[65536];
-        unsigned long long left = nbytes;
-        int failed = 0;
-        while (left) {
-            size_t chunk = sizeof(buf);
-            if ((unsigned long long)chunk > left)
-                chunk = (size_t)left;
-            for (size_t i = 0; i < chunk; i++)
-                buf[i] = body_byte((size_t)(nbytes - left) + i);
-            ssize_t n = opt->min_protection == PS_PROTECTION_AUTHENTICATED
-                            ? ps_send_protected(conn, buf, chunk, PS_PROTECTION_AUTHENTICATED)
-                            : ps_send(conn, buf, chunk);
-            if (n <= 0) {
-                fprintf(stderr, "spt_http: send failed: %s\n", ps_strerror(ps_connection_error(conn)));
-                failed = 1;
-                break;
-            }
-            left -= (unsigned long long)n;
+        uint8_t *buf = (uint8_t *)malloc(kChunk);
+        if (!buf) {
+            fprintf(stderr, "spt_http: out of memory\n");
+            ps_close(conn);
+            continue;
         }
+        fill_pattern(buf, 0, kChunk);
+        unsigned long long off = 0;
+        int failed = 0;
+        while (off < nbytes) {
+            size_t chunk = kChunk;
+            if ((unsigned long long)chunk > nbytes - off)
+                chunk = (size_t)(nbytes - off);
+            if ((off & 0xffffu) != 0)
+                fill_pattern(buf, off, chunk);
+            size_t sent = 0;
+            while (sent < chunk) {
+                ssize_t n = opt->min_protection == PS_PROTECTION_AUTHENTICATED
+                                ? ps_send_protected(conn, buf + sent, chunk - sent,
+                                                    PS_PROTECTION_AUTHENTICATED)
+                                : ps_send(conn, buf + sent, chunk - sent);
+                if (n <= 0) {
+                    fprintf(stderr, "spt_http: send failed: %s\n",
+                            ps_strerror(ps_connection_error(conn)));
+                    failed = 1;
+                    break;
+                }
+                sent += (size_t)n;
+            }
+            if (failed)
+                break;
+            off += chunk;
+        }
+        free(buf);
         if (!failed)
             ps_shutdown(conn, SHUT_WR);
         ps_close(conn);
@@ -358,26 +417,35 @@ static int run_client(struct ps_options *opt, const char *host, uint16_t port, u
         ps_close(conn);
         return 1;
     }
+    uint8_t *buf = (uint8_t *)malloc(kChunk);
+    if (!buf) {
+        fprintf(stderr, "spt_http: out of memory\n");
+        ps_close(conn);
+        return 1;
+    }
     uint64_t t0 = now_ms();
     unsigned long long got = 0;
-    uint8_t buf[65536];
     while (got < nbytes) {
-        ssize_t n = ps_recv(conn, buf, sizeof(buf));
+        size_t want = kChunk;
+        if ((unsigned long long)want > nbytes - got)
+            want = (size_t)(nbytes - got);
+        ssize_t n = ps_recv(conn, buf, want);
         if (n <= 0) {
             fprintf(stderr, "short body %llu/%llu: %s\n", got, nbytes,
                     ps_strerror(ps_connection_error(conn)));
+            free(buf);
             ps_close(conn);
             return 1;
         }
-        for (ssize_t i = 0; i < n && got + (unsigned long long)i < nbytes; i++) {
-            if (buf[i] != body_byte((size_t)got + (size_t)i)) {
-                fprintf(stderr, "body mismatch\n");
-                ps_close(conn);
-                return 1;
-            }
+        if (!pattern_matches(buf, got, (size_t)n)) {
+            fprintf(stderr, "body mismatch\n");
+            free(buf);
+            ps_close(conn);
+            return 1;
         }
         got += (unsigned long long)n;
     }
+    free(buf);
     uint64_t dt = now_ms() - t0;
     if (dt == 0)
         dt = 1;
@@ -406,6 +474,8 @@ int main(int argc, char **argv)
     opt.max_sockets = 8;
     opt.initial_sockets = 8;
     opt.worker_threads = 8;
+    opt.frame_size = kFrame;
+    opt.receive_window = 512ull << 20;
     if (strcmp(argv[1], "server") == 0) {
         int public_body = (argc > 4 && strcmp(argv[4], "public") == 0) ||
                           (argc > 5 && strcmp(argv[5], "public") == 0);
