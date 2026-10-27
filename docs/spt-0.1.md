@@ -134,7 +134,7 @@ The authentication tag is 16 bytes. The nonce is 12 bytes:
 nonce = static_iv XOR encode96(record_sequence)
 ```
 
-`encode96` is 4 zero bytes followed by the sequence as a big-endian `u64`. Nonce reuse under one key is forbidden. A direction on a subflow and generation may seal at most `2^20` records, then that side sends `KEY_UPDATE` for the next generation. Sequence 0 of generation 0 is `JOIN` from the client and `JOIN_ACK` from the server. Later generations may use sequence 0 for data. The sender switches to a new generation only after it has announced the generation and has seen the peer's announcement. A receiver installs the next generation when it sees a record with `generation + 1` and sequence 0.
+`encode96` is 4 zero bytes followed by the sequence as a big-endian `u64`. Nonce reuse under one key is forbidden. A direction on a subflow and generation may seal at most `2^20` records. At that limit the sender stops using the subflow. A further seal fails the session with error code 8, usage limit. `KEY_UPDATE` is sent when that side starts a rekey, which is separate from hitting the limit. Sequence 0 of generation 0 is `JOIN` from the client and `JOIN_ACK` from the server. Later generations may use sequence 0 for data. The sender switches to a new generation only after it has announced the generation and has seen the peer's announcement. A receiver installs the next generation when it sees a record with `generation + 1` and sequence 0.
 
 `hello_hash` is SHA-256 of `client_hello_body || server_hello_body`, the raw hello bodies, not the control envelopes.
 
@@ -179,7 +179,7 @@ Protection profiles:
 | 0 | confidential | AEAD ciphertext. This is the default, and byte 36 stays 0. |
 | 1 | authenticated | plaintext. Tag is HMAC-SHA-256 over the 40-byte header and the payload, truncated to 16 bytes. |
 
-Any other profile value is rejected before the payload is delivered. `JOIN`, `JOIN_ACK`, `SUBFLOW_END`, and `EOS` are confidential. Only `DATA` may be authenticated. The receiver drops a record whose profile is weaker than its configured minimum. Confidential is stronger than authenticated, so a confidential record is always acceptable to a peer that has authorized authentication-only data.
+Any other profile value is rejected before the payload is delivered. `JOIN`, `JOIN_ACK`, `SUBFLOW_END`, and `EOS` are confidential. Only `DATA` may be authenticated. A record whose profile is weaker than the receiver's configured minimum fails the session with a protocol error and is not delivered. Confidential is stronger than authenticated, so a confidential record is always acceptable to a peer that has authorized authentication-only data.
 
 Both peers send `PROTECTION` on the TLS control connection immediately after their hello. The body is `u8 minimum`, `u8 mac_alg` (`1` = HMAC-SHA-256), `u16` reserved 0. A peer's message records the floor it will accept. It does not lower the local floor. Sending authenticated data requires the local minimum and the peer minimum to both be authenticated. If the peer message has not arrived yet, the send waits. A second message with a different minimum is a protocol error.
 
