@@ -161,14 +161,63 @@ static void raise_memlock(size_t bytes)
     if (lim.rlim_max > lim.rlim_cur) {
         up.rlim_cur = lim.rlim_max;
         up.rlim_max = lim.rlim_max;
-        if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
-            return;
+        setrlimit(RLIMIT_MEMLOCK, &up);
     }
-    char soft[32];
-    char hard[32];
-    format_rlim(lim.rlim_cur, soft, sizeof(soft));
-    format_rlim(lim.rlim_max, hard, sizeof(hard));
-    ps_notice("rdma memlock soft %s hard %s is below %zu bytes", soft, hard, bytes);
+}
+
+static size_t slot_stride(size_t message)
+{
+    size_t page = host_page();
+    return (message + page - 1u) & ~(page - 1u);
+}
+
+int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth)
+{
+    if (!send_depth || !recv_depth || lanes < 1 || message == 0)
+        return -1;
+    unsigned send = *send_depth;
+    unsigned recv = *recv_depth;
+    if (send < 2)
+        send = 2;
+    if (recv < 4)
+        recv = 4;
+    if (send > 256)
+        send = 256;
+    if (recv > 256)
+        recv = 256;
+    size_t stride = slot_stride(message);
+    raise_memlock(stride * (size_t)(send + recv) * (size_t)lanes);
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_MEMLOCK, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY) {
+        *send_depth = send;
+        *recv_depth = recv;
+        return 0;
+    }
+    size_t budget = (size_t)lim.rlim_cur / stride;
+    if (budget / lanes < 6)
+        return -1;
+    unsigned per = (unsigned)(budget / lanes);
+    if (per > 512)
+        per = 512;
+    /* Outstanding data is limited by both queues. Shrink the larger one first. */
+    while ((size_t)send + recv > per) {
+        if (recv >= send && recv > 4)
+            recv--;
+        else if (send > 2)
+            send--;
+        else if (recv > 4)
+            recv--;
+        else
+            return -1;
+    }
+    if (send != *send_depth || recv != *recv_depth) {
+        char soft[32];
+        format_rlim(lim.rlim_cur, soft, sizeof(soft));
+        ps_notice("rdma queue depths reduced to send %u recv %u to fit memlock %s", send, recv, soft);
+    }
+    *send_depth = send;
+    *recv_depth = recv;
+    return 0;
 }
 
 static int setup_buffers(struct ps_rdma *r, struct rdma_lane *ln)
@@ -177,8 +226,7 @@ static int setup_buffers(struct ps_rdma *r, struct rdma_lane *ln)
         return 0;
     /* One MR per slot. irdma returns ENOMEM for a single registration of the
        whole queue (about 20 MiB). Each slot stays under one page-aligned frame. */
-    size_t page = host_page();
-    size_t stride = (r->message_bytes + page - 1u) & ~(page - 1u);
+    size_t stride = slot_stride(r->message_bytes);
     unsigned nslots = r->send_depth + r->recv_depth;
     if (nslots > 512)
         return -1;
@@ -910,6 +958,15 @@ int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot)
     (void)lane;
     (void)slot;
     return -1;
+}
+
+int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth)
+{
+    (void)message;
+    (void)lanes;
+    (void)send_depth;
+    (void)recv_depth;
+    return 0;
 }
 
 #endif

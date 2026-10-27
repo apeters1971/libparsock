@@ -1648,8 +1648,16 @@ static void send_transport_offer_locked(struct ps_session *s)
     msg.fallback = s->allow_tcp_fallback ? 1 : 0;
     msg.initial_lanes = s->expect ? s->expect : 1;
     msg.max_lanes = s->max_sockets >= msg.initial_lanes ? s->max_sockets : msg.initial_lanes;
-    msg.send_depth = s->rdma_send_depth;
-    msg.recv_depth = s->rdma_recv_depth;
+    unsigned send_d = s->rdma_send_depth;
+    unsigned recv_d = s->rdma_recv_depth;
+    size_t message = spt_frame_wire_len((uint32_t)s->frame_size);
+    if (ps_rdma_clamp_depths(message, msg.initial_lanes, &send_d, &recv_d) != 0) {
+        ps_notice("rdma queue does not fit in the locked-memory limit");
+        fail_locked(s, PS_ERR_IO);
+        return;
+    }
+    msg.send_depth = send_d;
+    msg.recv_depth = recv_d;
     msg.max_message = (uint32_t)spt_frame_wire_len((uint32_t)s->frame_size);
     uint8_t body[SPT_TRANSPORT_OFFER_LEN];
     if (spt_transport_offer_encode(body, &msg) != 0) {
@@ -1708,7 +1716,9 @@ static void handle_transport_offer_locked(struct ps_session *s, const uint8_t *b
             lanes = msg.max_lanes;
         if (lanes > 16)
             lanes = 16;
-        if (lanes >= 1 && select_rdma_locked(s, lanes, send_d, recv_d, 0) == 0)
+        if (lanes >= 1 && ps_rdma_clamp_depths(wire, lanes, &send_d, &recv_d) != 0)
+            ps_notice("rdma queue does not fit in the locked-memory limit");
+        else if (lanes >= 1 && select_rdma_locked(s, lanes, send_d, recv_d, 0) == 0)
             opened = 1;
     }
     if (!opened) {
@@ -3071,7 +3081,7 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
         if (n < 0) {
             if (errn == EINTR)
                 continue;
-            if (errn == EAGAIN || errn == EWOULDBLOCK)
+            if (errn == EAGAIN || errn == EWOULDBLOCK || errn == ENOBUFS || errn == ENOMEM)
                 break;
             fail_locked(session, PS_ERR_IO);
             break;
@@ -3179,7 +3189,7 @@ int ps_session_flush(ps_session_t *session, int fd, size_t max_bytes)
                 unlock_s(session);
                 continue;
             }
-            if (errn == EAGAIN || errn == EWOULDBLOCK) {
+            if (errn == EAGAIN || errn == EWOULDBLOCK || errn == ENOBUFS || errn == ENOMEM) {
                 sf->want_write = 1;
                 unlock_s(session);
                 break;

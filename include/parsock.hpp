@@ -495,8 +495,10 @@ public:
         const ssize_t n = ps_send_protected(conn_, data, length, static_cast<ps_protection_t>(profile));
         if (n < 0)
             throw failure(detail::code_of(n));
-        if (static_cast<std::size_t>(n) != length)
-            throw failure(errc::io);
+        if (static_cast<std::size_t>(n) != length) {
+            const int err = ps_connection_error(conn_);
+            throw failure(err > 0 ? err : static_cast<int>(errc::io));
+        }
     }
 
     std::size_t recv(void *data, std::size_t length)
