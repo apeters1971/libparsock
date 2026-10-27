@@ -233,7 +233,7 @@ static int setup_buffers(struct ps_rdma *r, struct rdma_lane *ln)
     size_t alloc = stride * (size_t)nslots;
     raise_memlock(alloc);
     void *raw = NULL;
-    int arc = posix_memalign(&raw, page, alloc);
+    int arc = posix_memalign(&raw, host_page(), alloc);
     if (arc != 0) {
         ps_notice("rdma buffer allocation failed: %s (%zu bytes)", strerror(arc), alloc);
         return -1;
