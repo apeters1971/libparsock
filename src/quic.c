@@ -33,7 +33,7 @@
    about 40 MB/s. 16 MiB leaves room for a millisecond of delay. */
 #define QUIC_WINDOW (16u << 20)
 #define QUIC_CIDLEN 18u
-#define QUIC_BURST 32
+#define QUIC_BURST 64
 #define QUIC_WRITE_MAX 1024
 
 struct qconn {
@@ -288,9 +288,9 @@ static void tune_settings(ngtcp2_settings *settings, ngtcp2_tstamp now)
 {
     settings->initial_ts = now;
     settings->handshake_timeout = 15 * NGTCP2_SECONDS;
-    settings->no_pmtud = 1;
+    settings->no_pmtud = 0;
     settings->initial_rtt = NGTCP2_MILLISECONDS;
-    settings->ack_thresh = 1;
+    settings->ack_thresh = 2;
     settings->max_window = QUIC_WINDOW;
     settings->max_stream_window = QUIC_WINDOW;
 }
@@ -380,7 +380,7 @@ static int udp_socket(int family)
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-    int buf = 4 * 1024 * 1024;
+    int buf = 16 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     int flags = fcntl(fd, F_GETFD, 0);
@@ -607,7 +607,6 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
         }
         if (accepted > 0)
             c->tx_sent += (size_t)accepted;
-        ngtcp2_conn_update_pkt_tx_time(c->conn, ts);
         lens[nbuf++] = (uint16_t)nwrite;
         if (nbuf == QUIC_BURST) {
             int rc = emit_bufs(c, fd, bufs, lens, nbuf);
@@ -616,8 +615,10 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
                 return kill_conn(c, 1);
             }
             nbuf = 0;
-            if (rc > 0)
+            if (rc > 0) {
+                ngtcp2_conn_update_pkt_tx_time(c->conn, ts);
                 return 1;
+            }
         }
     }
     if (nbuf > 0) {
@@ -626,9 +627,12 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
             c->dead = 1;
             return kill_conn(c, 1);
         }
-        if (rc > 0)
+        if (rc > 0) {
+            ngtcp2_conn_update_pkt_tx_time(c->conn, ts);
             return 1;
+        }
     }
+    ngtcp2_conn_update_pkt_tx_time(c->conn, ts);
     if (hit_cap)
         c->need_write = 1;
     return 0;
