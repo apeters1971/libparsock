@@ -394,7 +394,12 @@ static int udp_socket(int family)
 
 static int udp_again(int err)
 {
-    return err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS || err == ENOMEM;
+    /* ECONNREFUSED is an asynchronous ICMP error for an earlier datagram.
+       Linux surfaces it on the next send or receive and leaves any queued
+       packets unread. Killing the lane there drops a transfer at the first
+       window. */
+    return err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS || err == ENOMEM ||
+           err == ECONNREFUSED;
 }
 
 static int send_udp(struct qconn *c, int fd, const uint8_t *data, size_t len)
@@ -580,6 +585,11 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
             nwrite = ngtcp2_conn_write_stream(c->conn, NULL, NULL, bufs[nbuf], sizeof(bufs[nbuf]),
                                               &accepted, NGTCP2_WRITE_STREAM_FLAG_NONE, -1, NULL, 0,
                                               ts);
+        }
+        if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED || nwrite == NGTCP2_ERR_WRITE_MORE) {
+            c->need_write = 1;
+            hit_cap = 0;
+            break;
         }
         if (nwrite == 0) {
             hit_cap = 0;
