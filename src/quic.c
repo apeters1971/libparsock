@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -144,9 +145,27 @@ static int recv_stream_cb(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id, 
         c->fin = 1;
     if (datalen == 0)
         return 0;
-    if (!data || c->rx_len + datalen > c->rx_cap) {
+    if (!data) {
         c->dead = 1;
         return 0;
+    }
+    if (c->rx_len + datalen > c->rx_cap) {
+        /* One recvmmsg batch can cross the flow-control window. Keep that
+           batch; further reads wait until the application drains. */
+        size_t need = c->rx_len + datalen;
+        size_t cap = (size_t)QUIC_WINDOW + 64u * 1024u;
+        if (need > cap) {
+            ps_notice("quic rx full %zu+%zu", c->rx_len, datalen);
+            c->dead = 1;
+            return 0;
+        }
+        uint8_t *nbuf = (uint8_t *)realloc(c->rx, cap);
+        if (!nbuf) {
+            c->dead = 1;
+            return 0;
+        }
+        c->rx = nbuf;
+        c->rx_cap = cap;
     }
     memcpy(c->rx + c->rx_len, data, datalen);
     c->rx_len += datalen;
@@ -202,6 +221,7 @@ static int stream_reset_cb(ngtcp2_conn *conn, int64_t stream_id, uint64_t final_
     (void)final_size;
     (void)app_error_code;
     (void)stream_user_data;
+    ps_notice("quic stream reset id=%lld", (long long)stream_id);
     ((struct qconn *)user_data)->dead = 1;
     return 0;
 }
@@ -372,6 +392,11 @@ static int udp_socket(int family)
     return fd;
 }
 
+static int udp_again(int err)
+{
+    return err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS || err == ENOMEM;
+}
+
 static int send_udp(struct qconn *c, int fd, const uint8_t *data, size_t len)
 {
     ssize_t n;
@@ -382,8 +407,9 @@ static int send_udp(struct qconn *c, int fd, const uint8_t *data, size_t len)
     if (n < 0) {
         if (errno == EINTR)
             return send_udp(c, fd, data, len);
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (udp_again(errno))
             return 1;
+        ps_notice("quic udp send: %s", strerror(errno));
         return -1;
     }
     return (size_t)n == len ? 0 : -1;
@@ -416,8 +442,9 @@ static int send_many(struct qconn *c, int fd, uint8_t pkts[][1500], const uint16
         if (rc < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (udp_again(errno))
                 break;
+            ps_notice("quic udp send: %s", strerror(errno));
             return -1;
         }
         if (rc == 0)
@@ -784,8 +811,15 @@ static int pump_one(struct ps_quic *q, struct qconn *hint, const uint8_t *buf, s
     return 0;
 }
 
+static int rx_saturated(const struct qconn *c)
+{
+    return c && c->rx && c->rx_len >= (size_t)QUIC_WINDOW;
+}
+
 static int pump_fd(struct ps_quic *q, struct qconn *hint, int fd, ngtcp2_tstamp ts)
 {
+    if (rx_saturated(hint))
+        return 0;
 #if defined(__linux__)
     uint8_t bufs[QUIC_BURST][2048];
     struct mmsghdr msgs[QUIC_BURST];
@@ -801,12 +835,15 @@ static int pump_fd(struct ps_quic *q, struct qconn *hint, int fd, ngtcp2_tstamp 
             msgs[i].msg_hdr.msg_name = &peers[i];
             msgs[i].msg_hdr.msg_namelen = sizeof(peers[i]);
         }
+        if (rx_saturated(hint))
+            return 0;
         int n = recvmmsg(fd, msgs, QUIC_BURST, 0, NULL);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (udp_again(errno))
                 return 0;
+            ps_notice("quic udp recv: %s", strerror(errno));
             if (hint) {
                 hint->dead = 1;
                 return kill_conn(hint, 1);
@@ -829,12 +866,15 @@ static int pump_fd(struct ps_quic *q, struct qconn *hint, int fd, ngtcp2_tstamp 
     for (;;) {
         struct sockaddr_storage peer;
         socklen_t plen = sizeof(peer);
+        if (rx_saturated(hint))
+            return 0;
         ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &plen);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (udp_again(errno))
                 return 0;
+            ps_notice("quic udp recv: %s", strerror(errno));
             if (hint) {
                 hint->dead = 1;
                 return kill_conn(hint, 1);
@@ -981,6 +1021,21 @@ int ps_quic_wants_write(const struct ps_quic *quic)
             return 1;
     }
     return 0;
+}
+
+int ps_quic_wants_read(const struct ps_quic *quic, int fd)
+{
+    if (!quic || fd < 0)
+        return 0;
+    if (quic->is_server)
+        return 1;
+    for (unsigned i = 0; i < quic->max_lanes; i++) {
+        const struct qconn *c = &quic->conns[i];
+        if (!c->used || c->fd != fd)
+            continue;
+        return !rx_saturated(c);
+    }
+    return 1;
 }
 
 int ps_quic_progress(struct ps_quic *quic)
@@ -1308,6 +1363,13 @@ int ps_quic_fds(struct ps_quic *quic, int *fds, int max)
 int ps_quic_wants_write(const struct ps_quic *quic)
 {
     (void)quic;
+    return 0;
+}
+
+int ps_quic_wants_read(const struct ps_quic *quic, int fd)
+{
+    (void)quic;
+    (void)fd;
     return 0;
 }
 

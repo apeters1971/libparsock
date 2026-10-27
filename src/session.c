@@ -4929,7 +4929,7 @@ int ps_session_watches(const ps_session_t *session, struct ps_watch *out, int ma
             if (seen || qfds[i] < 0)
                 continue;
             out[n].fd = qfds[i];
-            out[n].want_read = 1;
+            out[n].want_read = ps_quic_wants_read(s->quic, qfds[i]);
             out[n].want_write = wr;
             n++;
         }
