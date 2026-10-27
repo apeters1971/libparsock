@@ -109,6 +109,14 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token, size_t
     return 0;
 }
 
+#if NGTCP2_VERSION_NUM >= 0x011600
+static int new_cid_cb2(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token,
+                       size_t cidlen, void *user_data)
+{
+    return new_cid_cb(conn, cid, token->data, cidlen, user_data);
+}
+#endif
+
 static int recv_stream_cb(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id, uint64_t offset,
                           const uint8_t *data, size_t datalen, void *user_data,
                           void *stream_user_data)
@@ -118,15 +126,17 @@ static int recv_stream_cb(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id, 
     (void)stream_user_data;
     struct qconn *c = (struct qconn *)user_data;
     if (c->stream_ready && stream_id != c->stream_id)
-        return NGTCP2_ERR_CALLBACK_FAILURE;
+        return 0;
     c->stream_id = stream_id;
     c->stream_ready = 1;
     if (flags & NGTCP2_STREAM_DATA_FLAG_FIN)
         c->fin = 1;
     if (datalen == 0)
         return 0;
-    if (!data || c->rx_len + datalen > c->rx_cap)
-        return NGTCP2_ERR_CALLBACK_FAILURE;
+    if (!data || c->rx_len + datalen > c->rx_cap) {
+        c->dead = 1;
+        return 0;
+    }
     memcpy(c->rx + c->rx_len, data, datalen);
     c->rx_len += datalen;
     return 0;
@@ -147,8 +157,17 @@ static int acked_cb(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset, uint6
     struct qconn *c = (struct qconn *)user_data;
     if (!c->stream_ready || stream_id != c->stream_id || datalen == 0)
         return 0;
+    /* Failing this callback makes ngtcp2 1.22 walk an acknowledgement
+       iterator that is already at the beginning and abort. */
+    if (offset < c->tx_ack) {
+        uint64_t end = offset + datalen;
+        if (end <= c->tx_ack)
+            return 0;
+        datalen = end - c->tx_ack;
+        offset = c->tx_ack;
+    }
     if (offset != c->tx_ack || datalen > c->tx_len)
-        return NGTCP2_ERR_CALLBACK_FAILURE;
+        return 0;
     c->tx_pos += (size_t)datalen;
     c->tx_len -= (size_t)datalen;
     c->tx_ack += datalen;
@@ -173,7 +192,7 @@ static int stream_reset_cb(ngtcp2_conn *conn, int64_t stream_id, uint64_t final_
     (void)app_error_code;
     (void)stream_user_data;
     ((struct qconn *)user_data)->dead = 1;
-    return NGTCP2_ERR_CALLBACK_FAILURE;
+    return 0;
 }
 
 static int alpn_select(SSL *ssl, const unsigned char **out, unsigned char *outlen,
@@ -195,8 +214,8 @@ static void fill_callbacks(ngtcp2_callbacks *cb, int is_server)
     else {
         cb->client_initial = ngtcp2_crypto_client_initial_cb;
         cb->recv_retry = ngtcp2_crypto_recv_retry_cb;
-        cb->version_negotiation = ngtcp2_crypto_version_negotiation_cb;
     }
+    cb->version_negotiation = ngtcp2_crypto_version_negotiation_cb;
     cb->recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
     cb->handshake_completed = handshake_cb;
     cb->encrypt = ngtcp2_crypto_encrypt_cb;
@@ -206,11 +225,16 @@ static void fill_callbacks(ngtcp2_callbacks *cb, int is_server)
     cb->acked_stream_data_offset = acked_cb;
     cb->stream_reset = stream_reset_cb;
     cb->rand = rand_cb;
+#if NGTCP2_VERSION_NUM >= 0x011600
+    cb->get_new_connection_id2 = new_cid_cb2;
+    cb->get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
+#else
     cb->get_new_connection_id = new_cid_cb;
+    cb->get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb;
+#endif
     cb->update_key = ngtcp2_crypto_update_key_cb;
     cb->delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
     cb->delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-    cb->get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb;
 }
 
 static void fill_params(ngtcp2_transport_params *params)
@@ -283,18 +307,20 @@ static int conn_tls(struct qconn *c, SSL_CTX *ctx, const char *server_name)
     ngtcp2_crypto_ossl_ctx_set_ssl(c->ossl, c->ssl);
     c->ref.get_conn = crypto_get_conn;
     c->ref.user_data = c->conn;
-    SSL_set_app_data(c->ssl, &c->ref);
     if (c->is_server) {
-        SSL_set_accept_state(c->ssl);
         if (ngtcp2_crypto_ossl_configure_server_session(c->ssl) != 0)
             return -1;
+        SSL_set_app_data(c->ssl, &c->ref);
+        SSL_set_accept_state(c->ssl);
+        SSL_set_quic_tls_early_data_enabled(c->ssl, 1);
     } else {
+        if (ngtcp2_crypto_ossl_configure_client_session(c->ssl) != 0)
+            return -1;
+        SSL_set_app_data(c->ssl, &c->ref);
         SSL_set_connect_state(c->ssl);
         if (server_name && server_name[0] && ps_tls_set_peer_name(c->ssl, server_name) != 0)
             return -1;
         if (SSL_set_alpn_protos(c->ssl, SPT_ALPN, sizeof(SPT_ALPN)) != 0)
-            return -1;
-        if (ngtcp2_crypto_ossl_configure_client_session(c->ssl) != 0)
             return -1;
     }
     return 0;
@@ -588,6 +614,7 @@ static int accept_server(struct ps_quic *q, const uint8_t *pkt, size_t pktlen,
     ngtcp2_settings_default(&settings);
     settings.initial_ts = ts;
     settings.handshake_timeout = 15 * NGTCP2_SECONDS;
+    settings.no_pmtud = 1;
     ngtcp2_transport_params params;
     fill_params(&params);
     params.original_dcid = hd.dcid;
@@ -806,8 +833,13 @@ int ps_quic_progress(struct ps_quic *quic)
     }
     for (unsigned i = 0; i < quic->max_lanes; i++) {
         struct qconn *c = &quic->conns[i];
-        if (!c->used || c->dead)
+        if (!c->used)
             continue;
+        if (c->dead) {
+            if (kill_conn(c, 1) < 0)
+                return -1;
+            continue;
+        }
         int fd = c->fd >= 0 ? c->fd : quic->fd;
         if (fd < 0)
             continue;
@@ -891,6 +923,7 @@ int ps_quic_connect(struct ps_quic *quic, uint32_t lane, const struct sockaddr *
     ngtcp2_settings_default(&settings);
     settings.initial_ts = qnow();
     settings.handshake_timeout = 15 * NGTCP2_SECONDS;
+    settings.no_pmtud = 1;
     ngtcp2_transport_params params;
     fill_params(&params);
     if (ngtcp2_conn_client_new(&c->conn, &dcid, &scid, &path.path, NGTCP2_PROTO_VER_V1, &cb,

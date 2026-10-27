@@ -43,7 +43,7 @@ int ps_rdma_available(void);
 /* Shrink send and recv so every lane fits in RLIMIT_MEMLOCK. Returns -1 when
    the minimum queue, 2 sends and 4 receives, does not fit. */
 int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth,
-                         unsigned *recv_depth);
+                         unsigned *recv_depth, int quiet);
 struct ps_rdma *ps_rdma_open(const struct ps_rdma_cfg *cfg, uint16_t *listen_port);
 void ps_rdma_close(struct ps_rdma *rdma);
 int ps_rdma_fds(struct ps_rdma *rdma, int *fds, int max);

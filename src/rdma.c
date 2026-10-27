@@ -171,7 +171,8 @@ static size_t slot_stride(size_t message)
     return (message + page - 1u) & ~(page - 1u);
 }
 
-int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth)
+int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth,
+                         int quiet)
 {
     if (!send_depth || !recv_depth || lanes < 1 || message == 0)
         return -1;
@@ -210,7 +211,7 @@ int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, u
         else
             return -1;
     }
-    if (send != *send_depth || recv != *recv_depth) {
+    if (!quiet && (send != *send_depth || recv != *recv_depth)) {
         char soft[32];
         format_rlim(lim.rlim_cur, soft, sizeof(soft));
         ps_notice("rdma queue depths reduced to send %u recv %u to fit memlock %s", send, recv, soft);
@@ -969,12 +970,14 @@ int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot)
     return -1;
 }
 
-int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth)
+int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth,
+                         int quiet)
 {
     (void)message;
     (void)lanes;
     (void)send_depth;
     (void)recv_depth;
+    (void)quiet;
     return 0;
 }
 

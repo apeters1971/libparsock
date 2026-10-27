@@ -1853,6 +1853,34 @@ static int select_quic_locked(struct ps_session *s, uint32_t lanes, uint16_t pee
     return 0;
 }
 
+/* Largest lane count that keeps the requested queue depths. One lane may
+   use shallower queues. Returns 0 when a single lane does not fit. */
+static unsigned rdma_lanes_fit(size_t message, unsigned lanes, unsigned send0, unsigned recv0,
+                               unsigned *send_d, unsigned *recv_d)
+{
+    if (lanes < 1)
+        lanes = 1;
+    if (lanes > 16)
+        lanes = 16;
+    while (lanes > 1) {
+        unsigned sd = send0;
+        unsigned rd = recv0;
+        if (ps_rdma_clamp_depths(message, lanes, &sd, &rd, 1) == 0 && sd >= send0 && rd >= recv0) {
+            *send_d = sd;
+            *recv_d = rd;
+            return lanes;
+        }
+        lanes--;
+    }
+    unsigned sd = send0;
+    unsigned rd = recv0;
+    if (ps_rdma_clamp_depths(message, 1, &sd, &rd, 0) != 0)
+        return 0;
+    *send_d = sd;
+    *recv_d = rd;
+    return 1;
+}
+
 static void send_transport_offer_locked(struct ps_session *s)
 {
     if (s->offer_sent || s->is_server || s->state == PS_STATE_FAILED)
@@ -1890,14 +1918,22 @@ static void send_transport_offer_locked(struct ps_session *s)
     msg.fallback = s->allow_tcp_fallback ? 1 : 0;
     msg.initial_lanes = s->expect ? s->expect : 1;
     msg.max_lanes = s->max_sockets >= msg.initial_lanes ? s->max_sockets : msg.initial_lanes;
-    unsigned send_d = s->rdma_send_depth;
-    unsigned recv_d = s->rdma_recv_depth;
+    unsigned send_d = 0;
+    unsigned recv_d = 0;
     size_t message = spt_frame_wire_len((uint32_t)s->frame_size);
-    if (ps_rdma_clamp_depths(message, msg.initial_lanes, &send_d, &recv_d) != 0) {
+    unsigned want = msg.initial_lanes;
+    unsigned fit = rdma_lanes_fit(message, want, s->rdma_send_depth, s->rdma_recv_depth, &send_d,
+                                  &recv_d);
+    if (fit == 0) {
         ps_notice("rdma queue does not fit in the locked-memory limit");
         fail_locked(s, PS_ERR_IO);
         return;
     }
+    if (fit < want)
+        ps_notice("rdma lanes reduced to %u to fit the locked-memory limit", fit);
+    msg.initial_lanes = fit;
+    if (msg.max_lanes > fit)
+        msg.max_lanes = fit;
     msg.send_depth = send_d;
     msg.recv_depth = recv_d;
     msg.max_message = (uint32_t)spt_frame_wire_len((uint32_t)s->frame_size);
@@ -1975,10 +2011,16 @@ static void handle_transport_offer_locked(struct ps_session *s, const uint8_t *b
             lanes = msg.max_lanes;
         if (lanes > 16)
             lanes = 16;
-        if (lanes >= 1 && ps_rdma_clamp_depths(wire, lanes, &send_d, &recv_d) != 0)
+        unsigned want = lanes;
+        unsigned fit = lanes >= 1 ? rdma_lanes_fit(wire, lanes, send_d, recv_d, &send_d, &recv_d) : 0;
+        if (fit == 0)
             ps_notice("rdma queue does not fit in the locked-memory limit");
-        else if (lanes >= 1 && select_rdma_locked(s, lanes, send_d, recv_d, 0) == 0)
-            opened = 1;
+        else {
+            if (fit < want)
+                ps_notice("rdma lanes reduced to %u to fit the locked-memory limit", fit);
+            if (select_rdma_locked(s, fit, send_d, recv_d, 0) == 0)
+                opened = 1;
+        }
     }
     if (!opened) {
         if ((!want_rdma && !want_quic) || fallback) {
