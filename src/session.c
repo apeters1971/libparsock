@@ -1603,10 +1603,21 @@ static int select_rdma_locked(struct ps_session *s, uint32_t lanes, unsigned sen
     cfg.recv_depth = recv_depth;
     cfg.max_lanes = (unsigned)lanes;
     cfg.message_bytes = spt_frame_wire_len((uint32_t)s->frame_size);
+    struct sockaddr_storage local;
+    socklen_t llen = (socklen_t)sizeof(local);
+    memset(&local, 0, sizeof(local));
+    if (s->is_server && s->ctrl_fd >= 0 &&
+        getsockname(s->ctrl_fd, (struct sockaddr *)&local, &llen) == 0) {
+        cfg.bind_addr = (struct sockaddr *)&local;
+        cfg.bind_len = llen;
+    }
     uint16_t bound = 0;
     struct ps_rdma *engine = ps_rdma_open(&cfg, s->is_server ? &bound : NULL);
-    if (!engine)
+    if (!engine) {
+        if (!ps_rdma_available())
+            ps_notice("RDMA backend is not built into this library");
         return -1;
+    }
     if (s->is_server && bound == 0) {
         ps_rdma_close(engine);
         return -1;

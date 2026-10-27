@@ -1,9 +1,11 @@
 #include "rdma.h"
 
 #include "log.h"
+#include "net.h"
 #include "spt_wire.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -95,7 +97,7 @@ static int ensure_device(struct ps_rdma *r, struct ibv_context *ctx)
         return -1;
     const char *name = ibv_get_device_name(ctx->device);
     if (r->device && name && strcmp(name, r->device) != 0) {
-        ps_log("rdma device %s does not match %s", name ? name : "?", r->device);
+        ps_notice("rdma device %s does not match %s", name ? name : "?", r->device);
         return -1;
     }
     if (!r->ctx) {
@@ -106,19 +108,19 @@ static int ensure_device(struct ps_rdma *r, struct ibv_context *ctx)
         r->pd = ibv_alloc_pd(ctx);
         r->comp = ibv_create_comp_channel(ctx);
         if (!r->pd || !r->comp) {
-            ps_log("rdma protection domain or completion channel failed");
+            ps_notice("rdma protection domain or completion channel failed");
             return -1;
         }
         set_nonblock(r->comp->fd);
         r->cq = ibv_create_cq(ctx, cqe, NULL, r->comp, 0);
         if (!r->cq || ibv_req_notify_cq(r->cq, 0) != 0) {
-            ps_log("rdma completion queue failed");
+            ps_notice("rdma completion queue failed");
             return -1;
         }
-        ps_log("rdma device %s cq=%d", name ? name : "?", cqe);
+        ps_notice("rdma device %s cq=%d", name ? name : "?", cqe);
     }
     if (ctx != r->ctx) {
-        ps_log("rdma connection resolved a different device");
+        ps_notice("rdma connection resolved a different device");
         return -1;
     }
     return 0;
@@ -137,7 +139,7 @@ static int setup_buffers(struct ps_rdma *r, struct rdma_lane *ln)
     memset(mem, 0, alloc);
     struct ibv_mr *mr = ibv_reg_mr(r->pd, mem, alloc, IBV_ACCESS_LOCAL_WRITE);
     if (!mr) {
-        ps_log("rdma memory registration failed: %s", strerror(errno));
+        ps_notice("rdma memory registration failed: %s", strerror(errno));
         free(mem);
         return -1;
     }
@@ -162,7 +164,7 @@ static int post_recv_slot(struct ps_rdma *r, struct rdma_lane *ln, unsigned slot
     wr.sg_list = &sge;
     wr.num_sge = 1;
     if (ibv_post_recv(ln->id->qp, &wr, &bad) != 0) {
-        ps_log("rdma post recv failed: %s", strerror(errno));
+        ps_notice("rdma post recv failed: %s", strerror(errno));
         return -1;
     }
     ln->recv_held[slot] = 0;
@@ -192,7 +194,7 @@ static int create_lane_qp(struct ps_rdma *r, struct rdma_lane *ln)
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
     if (rdma_create_qp(ln->id, r->pd, &attr) != 0) {
-        ps_log("rdma create qp failed: %s", strerror(errno));
+        ps_notice("rdma create qp failed: %s", strerror(errno));
         return -1;
     }
     ln->qp = 1;
@@ -273,7 +275,7 @@ static int handle_cm(struct ps_rdma *r, struct rdma_cm_event *event, struct ps_r
             }
         }
         if (!match) {
-            ps_log("rdma connect request rejected");
+            ps_notice("rdma connect request rejected");
             rdma_reject(id, NULL, 0);
             return 0;
         }
@@ -290,7 +292,7 @@ static int handle_cm(struct ps_rdma *r, struct rdma_cm_event *event, struct ps_r
         }
         struct rdma_conn_param cp = conn_param(NULL);
         if (rdma_accept(id, &cp) != 0) {
-            ps_log("rdma accept failed: %s", strerror(errno));
+            ps_notice("rdma accept failed: %s", strerror(errno));
             match->state = LANE_DEAD;
             return emit(ev, n, max, PS_RDMA_EV_ERROR, (uint32_t)(match - r->lanes), NULL, 0, 0);
         }
@@ -310,7 +312,7 @@ static int handle_cm(struct ps_rdma *r, struct rdma_cm_event *event, struct ps_r
 
     if (kind == RDMA_CM_EVENT_ADDR_RESOLVED) {
         if (rdma_resolve_route(id, 2000) != 0) {
-            ps_log("rdma resolve route failed: %s", strerror(errno));
+            ps_notice("rdma resolve route failed: %s", strerror(errno));
             ln->state = LANE_DEAD;
             return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
         }
@@ -323,7 +325,7 @@ static int handle_cm(struct ps_rdma *r, struct rdma_cm_event *event, struct ps_r
         }
         struct rdma_conn_param cp = conn_param(ln->token);
         if (rdma_connect(id, &cp) != 0) {
-            ps_log("rdma connect failed: %s", strerror(errno));
+            ps_notice("rdma connect failed: %s", strerror(errno));
             ln->state = LANE_DEAD;
             return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
         }
@@ -331,14 +333,14 @@ static int handle_cm(struct ps_rdma *r, struct rdma_cm_event *event, struct ps_r
     }
     if (kind == RDMA_CM_EVENT_ESTABLISHED) {
         ln->state = LANE_UP;
-        ps_log("rdma lane %u established", lane);
+        ps_notice("rdma lane %u established", lane);
         return emit(ev, n, max, PS_RDMA_EV_CONNECTED, lane, NULL, 0, 0);
     }
     if (kind == RDMA_CM_EVENT_DISCONNECTED || kind == RDMA_CM_EVENT_DEVICE_REMOVAL ||
         kind == RDMA_CM_EVENT_ADDR_ERROR || kind == RDMA_CM_EVENT_ROUTE_ERROR ||
         kind == RDMA_CM_EVENT_CONNECT_ERROR || kind == RDMA_CM_EVENT_UNREACHABLE ||
         kind == RDMA_CM_EVENT_REJECTED || kind == RDMA_CM_EVENT_ADDR_CHANGE) {
-        ps_log("rdma lane %u %s", lane, rdma_event_str(kind));
+        ps_notice("rdma lane %u %s", lane, rdma_event_str(kind));
         ln->state = LANE_DEAD;
         return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
     }
@@ -357,13 +359,13 @@ static int poll_cm(struct ps_rdma *r, struct ps_rdma_event *ev, int *n, int max)
         pfd.events = POLLIN;
         pfd.revents = 0;
         int pr = poll(&pfd, 1, 0);
-        if (pr <= 0)
+        if (pr <= 0 || (pfd.revents & POLLIN) == 0)
             return 0;
         struct rdma_cm_event *event = NULL;
         if (rdma_get_cm_event(r->ec, &event) != 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return 0;
-            ps_log("rdma cm event failed: %s", strerror(errno));
+            ps_notice("rdma cm event failed: %s", strerror(errno));
             return -1;
         }
         if (handle_cm(r, event, ev, n, max) != 0)
@@ -379,7 +381,7 @@ static void drain_notify(struct ps_rdma *r)
     pfd.fd = r->comp->fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
-    if (poll(&pfd, 1, 0) <= 0)
+    if (poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0)
         return;
     for (;;) {
         struct ibv_cq *cq = NULL;
@@ -402,7 +404,7 @@ static int poll_cq(struct ps_rdma *r, struct ps_rdma_event *ev, int *n, int max,
         if (got == 0)
             break;
         if (got < 0) {
-            ps_log("rdma poll cq failed");
+            ps_notice("rdma poll cq failed");
             return -1;
         }
         (*budget)--;
@@ -411,12 +413,12 @@ static int poll_cq(struct ps_rdma *r, struct ps_rdma_event *ev, int *n, int max,
         unsigned slot = 0;
         unpack_wr(wc.wr_id, &kind, &lane, &slot);
         if (lane >= PS_MAX_SUBFLOWS) {
-            ps_log("rdma completion for an unknown lane");
+            ps_notice("rdma completion for an unknown lane");
             return emit(ev, n, max, PS_RDMA_EV_ERROR, 0, NULL, 0, 0);
         }
         struct rdma_lane *ln = &r->lanes[lane];
         if (wc.status != IBV_WC_SUCCESS) {
-            ps_log("rdma completion status %s lane %u", ibv_wc_status_str(wc.status), lane);
+            ps_notice("rdma completion status %s lane %u", ibv_wc_status_str(wc.status), lane);
             ln->state = LANE_DEAD;
             if (kind == 1 && slot < 256)
                 ln->send_used[slot] = 0;
@@ -444,6 +446,61 @@ int ps_rdma_available(void)
     return 1;
 }
 
+static socklen_t copy_addr(const struct sockaddr *src, socklen_t srclen, struct sockaddr_storage *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+    if (!src || srclen <= 0 || (size_t)srclen > sizeof(*dst))
+        return 0;
+    memcpy(dst, src, (size_t)srclen);
+    if (dst->ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)dst;
+        if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+            struct sockaddr_in in4;
+            memset(&in4, 0, sizeof(in4));
+            in4.sin_family = AF_INET;
+            memcpy(&in4.sin_addr, in6->sin6_addr.s6_addr + 12, 4);
+            in4.sin_port = in6->sin6_port;
+            memset(dst, 0, sizeof(*dst));
+            memcpy(dst, &in4, sizeof(in4));
+            return (socklen_t)sizeof(in4);
+        }
+    }
+    return srclen;
+}
+
+static void format_addr(const struct sockaddr *sa, char *out, size_t n)
+{
+    if (!out || n == 0)
+        return;
+    out[0] = '\0';
+    const void *ip = NULL;
+    int fam = sa ? sa->sa_family : AF_UNSPEC;
+    if (fam == AF_INET)
+        ip = &((const struct sockaddr_in *)sa)->sin_addr;
+    else if (fam == AF_INET6)
+        ip = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+    if (!ip || !inet_ntop(fam, ip, out, (socklen_t)n))
+        snprintf(out, n, "unknown");
+}
+
+static int bind_listen(struct ps_rdma *r, struct sockaddr *addr)
+{
+    if (rdma_bind_addr(r->listen, addr) != 0)
+        return -1;
+    if (rdma_listen(r->listen, 16) != 0)
+        return -1;
+    return 0;
+}
+
+static int reset_listen(struct ps_rdma *r)
+{
+    if (r->listen) {
+        rdma_destroy_id(r->listen);
+        r->listen = NULL;
+    }
+    return rdma_create_id(r->ec, &r->listen, r, RDMA_PS_TCP);
+}
+
 struct ps_rdma *ps_rdma_open(const struct ps_rdma_cfg *cfg, uint16_t *listen_port)
 {
     if (!cfg || !depth_ok(cfg->send_depth, cfg->recv_depth, cfg->max_lanes, cfg->message_bytes))
@@ -463,29 +520,65 @@ struct ps_rdma *ps_rdma_open(const struct ps_rdma_cfg *cfg, uint16_t *listen_por
         r->device = strdup(cfg->device);
     r->ec = rdma_create_event_channel();
     if (!r->ec) {
-        ps_log("rdma event channel failed: %s", strerror(errno));
+        ps_notice("rdma event channel failed: %s", strerror(errno));
         ps_rdma_close(r);
         return NULL;
     }
-    set_nonblock(r->ec->fd);
+    /* The CM channel stays blocking. librdmacm reads a fixed-size event, and
+       O_NONBLOCK makes bind and resolve fail with EAGAIN. Callers poll first. */
     if (!cfg->is_server)
         return r;
     if (rdma_create_id(r->ec, &r->listen, r, RDMA_PS_TCP) != 0) {
-        ps_log("rdma listen id failed: %s", strerror(errno));
+        ps_notice("rdma listen id failed: %s", strerror(errno));
         ps_rdma_close(r);
         return NULL;
     }
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (rdma_bind_addr(r->listen, (struct sockaddr *)&addr) != 0 || rdma_listen(r->listen, 16) != 0) {
-        ps_log("rdma listen failed: %s", strerror(errno));
-        ps_rdma_close(r);
-        return NULL;
+    struct sockaddr_storage chosen;
+    memset(&chosen, 0, sizeof(chosen));
+    socklen_t chosen_len = 0;
+    int bound = 0;
+    if (cfg->bind_addr && cfg->bind_len > 0) {
+        chosen_len = copy_addr(cfg->bind_addr, cfg->bind_len, &chosen);
+        if (chosen_len > 0) {
+            ps_addr_set_port((struct sockaddr *)&chosen, chosen_len, 0);
+            if (bind_listen(r, (struct sockaddr *)&chosen) == 0) {
+                bound = 1;
+            } else {
+                char text[64];
+                format_addr((struct sockaddr *)&chosen, text, sizeof(text));
+                ps_notice("rdma bind %s failed: %s", text, strerror(errno));
+                if (reset_listen(r) != 0) {
+                    ps_notice("rdma listen id failed: %s", strerror(errno));
+                    ps_rdma_close(r);
+                    return NULL;
+                }
+            }
+        }
+    }
+    if (!bound) {
+        struct sockaddr_storage any;
+        memset(&any, 0, sizeof(any));
+        int fam = chosen_len > 0 ? chosen.ss_family : AF_INET;
+        if (fam == AF_INET6) {
+            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&any;
+            in6->sin6_family = AF_INET6;
+            in6->sin6_addr = in6addr_any;
+        } else {
+            struct sockaddr_in *in4 = (struct sockaddr_in *)&any;
+            in4->sin_family = AF_INET;
+            in4->sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+        if (bind_listen(r, (struct sockaddr *)&any) != 0) {
+            ps_notice("rdma listen failed: %s", strerror(errno));
+            ps_rdma_close(r);
+            return NULL;
+        }
+        memcpy(&chosen, &any, sizeof(any));
     }
     *listen_port = ntohs(rdma_get_src_port(r->listen));
-    ps_log("rdma listening on port %u", *listen_port);
+    char text[64];
+    format_addr((struct sockaddr *)&chosen, text, sizeof(text));
+    ps_notice("rdma listening on %s port %u", text, *listen_port);
     return r;
 }
 
@@ -576,14 +669,16 @@ int ps_rdma_connect(struct ps_rdma *rdma, uint32_t lane, const struct sockaddr *
     }
     memcpy(ln->token, token, 32);
     if (rdma_create_id(rdma->ec, &ln->id, rdma, RDMA_PS_TCP) != 0) {
-        ps_log("rdma id failed: %s", strerror(errno));
+        ps_notice("rdma id failed: %s", strerror(errno));
         ln->state = LANE_DEAD;
         pthread_mutex_unlock(&rdma->mu);
         return -1;
     }
+    struct sockaddr_storage dest;
+    socklen_t dest_len = copy_addr(peer, peer_len, &dest);
     ln->state = LANE_RESOLVE;
-    if (rdma_resolve_addr(ln->id, NULL, (struct sockaddr *)peer, 2000) != 0) {
-        ps_log("rdma resolve addr failed: %s", strerror(errno));
+    if (dest_len == 0 || rdma_resolve_addr(ln->id, NULL, (struct sockaddr *)&dest, 2000) != 0) {
+        ps_notice("rdma resolve addr failed: %s", strerror(errno));
         ln->state = LANE_DEAD;
     } else {
         rc = 0;
@@ -644,7 +739,7 @@ int ps_rdma_send(struct ps_rdma *rdma, uint32_t lane, const void *data, size_t l
             wr.opcode = IBV_WR_SEND;
             wr.send_flags = IBV_SEND_SIGNALED;
             if (ibv_post_send(ln->id->qp, &wr, &bad) != 0) {
-                ps_log("rdma post send failed: %s", strerror(errno));
+                ps_notice("rdma post send failed: %s", strerror(errno));
                 ln->state = LANE_DEAD;
                 rc = -1;
             } else {
@@ -746,3 +841,8 @@ int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot)
 }
 
 #endif
+
+int ps_rdma_supported(void)
+{
+    return ps_rdma_available();
+}

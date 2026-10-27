@@ -462,7 +462,7 @@ public:
         const std::string host_name(host);
         ps_connection_t *raw = ps_connect(host_name.c_str(), port, &opt.native());
         if (!raw)
-            throw failure(errc::io);
+            throw failure(ps_recent_error());
         return connection(raw);
     }
 
@@ -627,7 +627,7 @@ public:
             throw failure(errc::invalid);
         ps_connection_t *raw = ps_accept(ln_);
         if (!raw)
-            throw failure(errc::io);
+            throw failure(ps_recent_error());
         return connection(raw);
     }
 

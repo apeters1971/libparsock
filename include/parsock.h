@@ -181,6 +181,10 @@ int ps_close(ps_connection_t *conn);
 /* Selected data-plane transport: PS_TRANSPORT_TCP or PS_TRANSPORT_RDMA_RC.
    Zero until the peers have selected one. */
 int ps_connection_transport(const ps_connection_t *conn);
+/* 1 when this build includes the RDMA RC backend. */
+int ps_rdma_supported(void);
+/* Error from the most recent failed ps_connect or ps_accept on this thread. */
+int ps_recent_error(void);
 int ps_connection_error(const ps_connection_t *conn);
 int ps_connection_state(const ps_connection_t *conn);
 int ps_connection_stats(const ps_connection_t *conn, struct ps_stats *out);

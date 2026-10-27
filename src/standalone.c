@@ -686,6 +686,8 @@ static ps_connection_t *finish_server(struct ps_listener *ln, int fd, SSL *ssl)
     }
     uint32_t wait = timeout_or(ln->opt.connect_timeout_ms, 10000);
     if (ps_session_wait_open(session, wait) != 0) {
+        int err = ps_session_error(session);
+        ps_note_error(err > 0 ? err : PS_ERR_IO);
         stop_runtime(rt);
         ps_embed_close(session);
         free(rt);
@@ -794,6 +796,8 @@ ps_connection_t *ps_connect(const char *host, uint16_t port, const struct ps_opt
     }
     uint32_t wait = timeout_or(opt.connect_timeout_ms, 10000);
     if (ps_session_wait_open(session, wait) != 0) {
+        int err = ps_session_error(session);
+        ps_note_error(err > 0 ? err : PS_ERR_IO);
         stop_runtime(rt);
         ps_embed_close(session);
         free(rt);

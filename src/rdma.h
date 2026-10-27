@@ -20,6 +20,9 @@ struct ps_rdma_cfg {
     unsigned recv_depth;
     unsigned max_lanes;
     size_t message_bytes;
+    /* Server: local address of the accepted control socket. Port is ignored. */
+    const struct sockaddr *bind_addr;
+    socklen_t bind_len;
 };
 
 enum {

@@ -1141,6 +1141,10 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
     if (!server && cfg.send_path.empty() && cfg.bytes == 0 && cfg.seconds <= 0 && cfg.recv_path.empty())
         cfg.open_ended = true;
 
+    if (cfg.transport == parsock::transport::rdma && ps_rdma_supported() == 0)
+        throw std::runtime_error(
+            "RDMA transport is not in this build. Install librdmacm-devel and libibverbs-devel, then reconfigure and rebuild.");
+
     if (server) {
         if (!positionals.empty())
             throw std::runtime_error("server takes no positional arguments");
