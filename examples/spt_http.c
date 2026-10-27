@@ -402,9 +402,10 @@ int main(int argc, char **argv)
     struct ps_options opt;
     ps_options_init(&opt);
     opt.tls = &tls;
-    opt.min_sockets = 4;
-    opt.max_sockets = 4;
-    opt.initial_sockets = 4;
+    opt.min_sockets = 8;
+    opt.max_sockets = 8;
+    opt.initial_sockets = 8;
+    opt.worker_threads = 8;
     if (strcmp(argv[1], "server") == 0) {
         int public_body = (argc > 4 && strcmp(argv[4], "public") == 0) ||
                           (argc > 5 && strcmp(argv[5], "public") == 0);
