@@ -68,7 +68,9 @@ static int pump_control(ps_session_t *session)
         }
         ps_tls_log_errors("SSL_read");
         ps_session_fail(session, PS_ERR_TLS);
-        return -PS_ERR_TLS;
+        ps_session_control_eof(session);
+        ps_session_set_ctrl_want(session, 0, 0);
+        return PS_OK;
     }
     if (peer_closed) {
         ps_session_set_ctrl_want(session, 0, 0);
@@ -110,7 +112,9 @@ static int pump_control(ps_session_t *session)
         }
         ps_tls_log_errors("SSL_write");
         ps_session_fail(session, PS_ERR_TLS);
-        return -PS_ERR_TLS;
+        ps_session_control_eof(session);
+        ps_session_set_ctrl_want(session, 0, 0);
+        return PS_OK;
     }
     if (ps_session_ctrl_pending(session))
         want_write = 1;

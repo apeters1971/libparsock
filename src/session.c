@@ -347,6 +347,7 @@ static void send_eos_locked(struct ps_session *s);
 static void send_protection_locked(struct ps_session *s);
 static void apply_sf_locked(struct ps_session *s, struct subflow *sf);
 static void apply_all_locked(struct ps_session *s);
+static void note_truncated_locked(struct ps_session *s);
 static void dispatch(struct ps_session *s);
 
 static void lock_s(struct ps_session *s) { pthread_mutex_lock(&s->mu); }
@@ -1303,6 +1304,7 @@ static void apply_sf_locked(struct ps_session *s, struct subflow *sf)
     }
     if (applied && s->reassembly.head && s->reassembly.head->off == s->reassembly.deliver)
         note_data_locked(s);
+    note_truncated_locked(s);
 }
 
 static void apply_all_locked(struct ps_session *s)
@@ -3229,6 +3231,37 @@ static int tcp_data_pending(const struct ps_session *s)
     return 0;
 }
 
+static int rx_idle_locked(const struct ps_session *s)
+{
+    for (uint32_t i = 0; i < s->sf_count; i++) {
+        const struct subflow *sf = &s->sf[i];
+        if (!sf->used)
+            continue;
+        if (sf->in_flight || sf->in_head || rx_live(sf) > 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* All TCP data sockets have hit EOF. Wait until decrypted bytes are in the
+   reassembly buffer before failing, so a read still returns that tail. */
+static void note_truncated_locked(struct ps_session *s)
+{
+    if (s->state == PS_STATE_FAILED || s->got_eos || s->closing)
+        return;
+    if (tcp_data_pending(s) || !rx_idle_locked(s))
+        return;
+    int saw_eof = 0;
+    for (uint32_t i = 0; i < s->sf_count; i++) {
+        const struct subflow *sf = &s->sf[i];
+        if (sf->used && !sf->rdma && sf->state != SF_UNUSED && sf->state != SF_RETIRED &&
+            sf->peer_eof)
+            saw_eof = 1;
+    }
+    if (saw_eof)
+        fail_locked(s, PS_ERR_CLOSED);
+}
+
 void ps_session_control_eof(ps_session_t *session)
 {
     if (!session)
@@ -3244,8 +3277,8 @@ void ps_session_control_eof(ps_session_t *session)
     if (session->state != PS_STATE_FAILED) {
         if (session->got_eos)
             session->state = PS_STATE_CLOSED;
-        else if (!tcp_data_pending(session))
-            fail_locked(session, PS_ERR_CLOSED);
+        else
+            note_truncated_locked(session);
     }
     pthread_cond_broadcast(&session->cv);
     unlock_s(session);
@@ -3418,8 +3451,8 @@ int ps_session_ingest(ps_session_t *session, int fd, int *again)
             sf->want_read = 0;
             if (sf->fd >= 0)
                 queue_io(session, sf->fd, 0, sf->want_write);
-            if (!session->got_eos && !session->closing && !tcp_data_pending(session))
-                fail_locked(session, PS_ERR_CLOSED);
+            if (!session->got_eos && !session->closing)
+                note_truncated_locked(session);
             break;
         }
         sf->rx_len += (size_t)n;
@@ -3911,13 +3944,6 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
     lock_s(session);
     session->in_user_read = 1;
     for (;;) {
-        if (session->state == PS_STATE_FAILED) {
-            int err = session->err ? session->err : PS_ERR_PROTO;
-            session->in_user_read = 0;
-            session->err = err;
-            unlock_s(session);
-            return -err;
-        }
         size_t full_bytes = 0;
         size_t total_bytes = 0;
         struct spt_seg *segs = spt_reassembly_take(&session->reassembly, (uint8_t *)buf,
@@ -3946,6 +3972,13 @@ ssize_t ps_session_recv_wait(ps_session_t *session, void *buf, size_t len,
             if (need_dispatch || ps_session_inline_pending(session))
                 ps_session_progress_step(session);
             return (ssize_t)total_bytes;
+        }
+        if (session->state == PS_STATE_FAILED) {
+            int err = session->err ? session->err : PS_ERR_PROTO;
+            session->in_user_read = 0;
+            session->err = err;
+            unlock_s(session);
+            return -err;
         }
         if (eof_locked(session) || session->state == PS_STATE_CLOSED) {
             session->in_user_read = 0;

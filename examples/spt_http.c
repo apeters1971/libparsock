@@ -32,7 +32,8 @@ static void usage(void)
     fprintf(stderr,
             "usage:\n"
             "  spt_http server cert key [port] [public]\n"
-            "  spt_http client cert key host port bytes [public]\n"
+            "  spt_http client cert key host port bytes [public] [noverify]\n"
+            "noverify skips the body pattern check.\n"
             "A missing server certificate and key are written as a self-signed pair.\n");
 }
 
@@ -391,7 +392,8 @@ static int run_server(struct ps_options *opt, uint16_t port)
     }
 }
 
-static int run_client(struct ps_options *opt, const char *host, uint16_t port, unsigned long long nbytes)
+static int run_client(struct ps_options *opt, const char *host, uint16_t port,
+                      unsigned long long nbytes, int verify)
 {
     ps_connection_t *conn = ps_connect(host, port, opt);
     if (!conn) {
@@ -437,7 +439,7 @@ static int run_client(struct ps_options *opt, const char *host, uint16_t port, u
             ps_close(conn);
             return 1;
         }
-        if (!pattern_matches(buf, got, (size_t)n)) {
+        if (verify && !pattern_matches(buf, got, (size_t)n)) {
             fprintf(stderr, "body mismatch\n");
             free(buf);
             ps_close(conn);
@@ -493,14 +495,24 @@ int main(int argc, char **argv)
             usage();
             return 2;
         }
-        if (argc > 7 && strcmp(argv[7], "public") == 0)
-            opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+        int verify = 1;
+        for (int i = 7; i < argc; i++) {
+            if (strcmp(argv[i], "public") == 0)
+                opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+            else if (strcmp(argv[i], "noverify") == 0 || strcmp(argv[i], "--no-verify") == 0)
+                verify = 0;
+            else {
+                usage();
+                return 2;
+            }
+        }
         if (access(argv[2], R_OK) != 0 || access(argv[3], R_OK) != 0) {
             fprintf(stderr, "spt_http: certificate %s or key %s is missing\n", argv[2], argv[3]);
             return 1;
         }
         tls.server_name = argv[4];
-        return run_client(&opt, argv[4], (uint16_t)atoi(argv[5]), strtoull(argv[6], NULL, 10));
+        return run_client(&opt, argv[4], (uint16_t)atoi(argv[5]), strtoull(argv[6], NULL, 10),
+                          verify);
     }
     usage();
     return 2;
