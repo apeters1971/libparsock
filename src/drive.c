@@ -116,7 +116,9 @@ static int pump_control(ps_session_t *session)
         want_write = 1;
     ps_session_set_ctrl_want(session, 1, want_write);
     ps_session_progress(session);
-    return ps_session_rdma_service(session);
+    int rd = ps_session_rdma_service(session);
+    int qd = ps_session_quic_service(session);
+    return rd ? rd : qd;
 }
 
 int ps_on_readable(ps_session_t *session, int fd)
@@ -125,6 +127,8 @@ int ps_on_readable(ps_session_t *session, int fd)
         return -PS_ERR_INVAL;
     if (ps_session_is_rdma_fd(session, fd))
         return ps_session_rdma_service(session);
+    if (ps_session_is_quic_fd(session, fd))
+        return ps_session_quic_service(session);
     if (ps_session_is_control(session, fd))
         return pump_control(session);
     int again = 0;
@@ -139,6 +143,8 @@ int ps_on_writable(ps_session_t *session, int fd)
 {
     if (!session || fd < 0)
         return -PS_ERR_INVAL;
+    if (ps_session_is_quic_fd(session, fd))
+        return ps_session_quic_service(session);
     if (ps_session_is_control(session, fd))
         return pump_control(session);
     if (ps_session_is_connecting(session, fd)) {

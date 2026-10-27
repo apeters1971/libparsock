@@ -254,4 +254,4 @@ An independent implementation has to reproduce:
 
 ## Extensions
 
-Data sockets in this document are TCP. [spt-rdma.md](spt-rdma.md) specifies an optional RDMA data plane. Peers that do not exchange its transport messages stay on TCP.
+Data sockets in this document are TCP. [spt-rdma.md](spt-rdma.md) specifies an optional RDMA data plane. [spt-quic.md](spt-quic.md) specifies an optional QUIC data plane. Peers that do not exchange those transport messages stay on TCP.

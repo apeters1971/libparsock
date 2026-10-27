@@ -10,10 +10,15 @@ enable_language(CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(APPLE AND EXISTS "/opt/homebrew/opt/openssl@3")
-    set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3" CACHE PATH "OpenSSL 3 prefix" FORCE)
+# libngtcp2_crypto_ossl is built against one OpenSSL. Prefer that prefix so
+# the process does not load a second libssl. Homebrew's ngtcp2 formula
+# currently links OpenSSL 4; otherwise stay on OpenSSL 3.
+if(APPLE AND EXISTS "/opt/homebrew/opt/openssl@4/lib/libssl.dylib")
+    set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@4" CACHE PATH "OpenSSL prefix" FORCE)
+elseif(APPLE AND EXISTS "/opt/homebrew/opt/openssl@3")
+    set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3" CACHE PATH "OpenSSL prefix" FORCE)
 elseif(APPLE AND EXISTS "/usr/local/opt/openssl@3")
-    set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl@3" CACHE PATH "OpenSSL 3 prefix" FORCE)
+    set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl@3" CACHE PATH "OpenSSL prefix" FORCE)
 endif()
 
 find_package(OpenSSL 3.0 REQUIRED)
@@ -36,6 +41,25 @@ else()
     message(STATUS "libparsock RDMA backend: OFF")
 endif()
 
+option(PARSOCK_QUIC "Build the QUIC backend when libngtcp2 is available" ON)
+set(PARSOCK_HAVE_QUIC OFF)
+if(PARSOCK_QUIC)
+    find_path(NGTCP2_INCLUDE_DIR ngtcp2/ngtcp2.h
+              PATHS /opt/homebrew/include /usr/local/include)
+    find_library(NGTCP2_LIBRARY ngtcp2
+                 PATHS /opt/homebrew/lib /usr/local/lib)
+    find_library(NGTCP2_CRYPTO_LIBRARY ngtcp2_crypto_ossl
+                 PATHS /opt/homebrew/lib /usr/local/lib)
+    if(NGTCP2_INCLUDE_DIR AND NGTCP2_LIBRARY AND NGTCP2_CRYPTO_LIBRARY)
+        set(PARSOCK_HAVE_QUIC ON)
+    endif()
+endif()
+if(PARSOCK_HAVE_QUIC)
+    message(STATUS "libparsock QUIC backend: ON")
+else()
+    message(STATUS "libparsock QUIC backend: OFF")
+endif()
+
 add_library(parsock STATIC
     src/log.c
     src/frame.c
@@ -47,6 +71,7 @@ add_library(parsock STATIC
     src/tls.c
     src/options.c
     src/session.c
+    src/quic.c
     src/rdma.c
     src/drive.c
     src/standalone.c
@@ -61,6 +86,11 @@ if(PARSOCK_HAVE_RDMA)
     target_compile_definitions(parsock PRIVATE PARSOCK_HAVE_RDMA=1)
     target_include_directories(parsock PRIVATE ${RDMA_INCLUDE_DIR})
     target_link_libraries(parsock PUBLIC ${RDMA_CM_LIBRARY} ${IBVERBS_LIBRARY})
+endif()
+if(PARSOCK_HAVE_QUIC)
+    target_compile_definitions(parsock PRIVATE PARSOCK_HAVE_QUIC=1)
+    target_include_directories(parsock PRIVATE ${NGTCP2_INCLUDE_DIR})
+    target_link_libraries(parsock PUBLIC ${NGTCP2_LIBRARY} ${NGTCP2_CRYPTO_LIBRARY})
 endif()
 
 if(PARSOCK_ASAN)
@@ -93,6 +123,7 @@ endfunction()
 
 parsock_test(test_frame tests/test_frame.c)
 parsock_test(test_rdma tests/test_rdma.c)
+parsock_test(test_quic tests/test_quic.c)
 parsock_test(test_crypto tests/test_crypto.c)
 parsock_test(test_reassembly tests/test_reassembly.c)
 parsock_test(test_autoscale tests/test_autoscale.c)
@@ -103,6 +134,7 @@ parsock_test(test_protect tests/test_protect.c)
 enable_testing()
 add_test(NAME frame COMMAND test_frame)
 add_test(NAME rdma COMMAND test_rdma)
+add_test(NAME quic COMMAND test_quic ${TEST_CERT} ${TEST_KEY})
 add_test(NAME crypto COMMAND test_crypto)
 add_test(NAME reassembly COMMAND test_reassembly)
 add_test(NAME autoscale COMMAND test_autoscale)
@@ -129,7 +161,7 @@ target_link_libraries(spt_bench PRIVATE parsock)
 target_compile_options(spt_bench PRIVATE -Wall -Wextra -Werror)
 add_dependencies(spt_bench parsock_test_certs)
 add_test(NAME bench COMMAND spt_bench self-test ${TEST_CERT} ${TEST_KEY})
-set_tests_properties(transfer embed protect cxx bench PROPERTIES TIMEOUT 60)
+set_tests_properties(transfer embed protect cxx bench quic PROPERTIES TIMEOUT 60)
 
 install(TARGETS parsock ARCHIVE DESTINATION lib)
 install(FILES include/parsock.h include/parsock.hpp include/spt_wire.h DESTINATION include)

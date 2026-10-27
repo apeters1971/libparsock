@@ -47,7 +47,10 @@ int main(void)
     raw[37] = 1;
     expect(spt_header_decode(raw, &back) != 0, "reserved tail");
     raw[37] = 0;
-    raw[36] = 2;
+    raw[36] = SPT_PROTECTION_TRANSPORT;
+    expect(spt_header_decode(raw, &back) == 0, "transport profile");
+    expect(back.protection == SPT_PROTECTION_TRANSPORT, "transport field");
+    raw[36] = 9;
     expect(spt_header_decode(raw, &back) != 0, "unknown profile");
     raw[36] = 0;
     expect(spt_protection_accepts(SPT_PROTECTION_CONFIDENTIAL, SPT_PROTECTION_CONFIDENTIAL),
@@ -184,6 +187,30 @@ int main(void)
     expect(spt_transport_select_decode(sb, &sel2) == 0, "tcp select");
     expect(sel2.transport == SPT_TRANSPORT_TCP && sel2.lanes == 2, "tcp select lanes");
 
+    memset(&offer, 0, sizeof(offer));
+    offer.preference = SPT_TRANSPORT_QUIC;
+    offer.fallback = 0;
+    offer.initial_lanes = 4;
+    offer.max_lanes = 4;
+    offer.max_message = SPT_FRAME_HEADER_LEN + 65536 + SPT_TAG_LEN;
+    expect(spt_transport_offer_encode(ob, &offer) == 0, "quic offer encode");
+    expect(spt_transport_offer_decode(ob, &offer2) == 0, "quic offer decode");
+    expect(offer2.preference == SPT_TRANSPORT_QUIC && offer2.initial_lanes == 4 &&
+               offer2.send_depth == 0 && offer2.recv_depth == 0,
+           "quic offer fields");
+    memset(&sel, 0, sizeof(sel));
+    sel.transport = SPT_TRANSPORT_QUIC;
+    sel.rdma_port = 4433;
+    sel.lanes = 4;
+    expect(spt_transport_select_encode(sb, &sel) == 0, "quic select encode");
+    expect(spt_transport_select_decode(sb, &sel2) == 0, "quic select decode");
+    expect(sel2.transport == SPT_TRANSPORT_QUIC && sel2.rdma_port == 4433 && sel2.lanes == 4 &&
+               sel2.send_depth == 0,
+           "quic select fields");
+    sel.send_depth = 2;
+    expect(spt_transport_select_encode(sb, &sel) == 0, "quic select depth encode");
+    expect(spt_transport_select_decode(sb, &sel2) != 0, "quic select rejects depth");
+
     uint8_t root[32], cnonce[32], snonce[32], session_bytes[32], token_a[32], token_b[32];
     memset(root, 7, sizeof(root));
     memset(cnonce, 1, sizeof(cnonce));
@@ -194,6 +221,14 @@ int main(void)
     expect(memcmp(token_a, token_b, 32) == 0, "token stable");
     expect(spt_rdma_token(root, 5, cnonce, snonce, session_bytes, token_b) == 0, "token other lane");
     expect(memcmp(token_a, token_b, 32) != 0, "token lane bound");
+    uint8_t hello[SPT_HASH_LEN];
+    uint8_t context[SPT_QUIC_JOIN_CONTEXT_LEN];
+    memset(hello, 9, sizeof(hello));
+    expect(spt_quic_join_context(context, 4, cnonce, snonce, session_bytes, hello) == 0,
+           "quic context");
+    expect(context[0] == 0 && context[1] == 0 && context[2] == 0 && context[3] == 4, "quic lane");
+    expect(memcmp(context + 4, cnonce, 32) == 0, "quic client nonce");
+    expect(memcmp(context + 4 + 32 + 32 + 32, hello, 32) == 0, "quic hello hash");
 
     if (fails) {
         fprintf(stderr, "%d frame checks failed\n", fails);

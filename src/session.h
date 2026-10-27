@@ -61,5 +61,7 @@ int ps_session_wait_flush(ps_session_t *session, uint32_t timeout_ms);
 int ps_session_transport(const ps_session_t *session);
 int ps_session_is_rdma_fd(const ps_session_t *session, int fd);
 int ps_session_rdma_service(ps_session_t *session);
+int ps_session_is_quic_fd(const ps_session_t *session, int fd);
+int ps_session_quic_service(ps_session_t *session);
 
 #endif

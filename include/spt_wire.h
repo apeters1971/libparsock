@@ -69,7 +69,9 @@ enum {
 
 enum {
     SPT_PROTECTION_CONFIDENTIAL = 0,
-    SPT_PROTECTION_AUTHENTICATED = 1
+    SPT_PROTECTION_AUTHENTICATED = 1,
+    /* Confidentiality comes from the transport. Used by the QUIC backend. */
+    SPT_PROTECTION_TRANSPORT = 2
 };
 
 enum {
@@ -116,8 +118,13 @@ enum {
 
 enum {
     SPT_TRANSPORT_TCP = 1,
-    SPT_TRANSPORT_RDMA_RC = 2
+    SPT_TRANSPORT_RDMA_RC = 2,
+    SPT_TRANSPORT_QUIC = 3
 };
+
+#define SPT_QUIC_EXPORTER_LABEL "EXPORTER-libparsock-spt-quic/0.1"
+#define SPT_QUIC_JOIN_TAG_LEN 16
+#define SPT_QUIC_JOIN_CONTEXT_LEN (4u + SPT_NONCE_LEN + SPT_NONCE_LEN + SPT_SESSION_ID_LEN + SPT_HASH_LEN)
 
 enum {
     SPT_E_OK = 0,
@@ -240,6 +247,13 @@ int spt_preface_decode(const uint8_t in[SPT_PREFACE_LEN], uint32_t *subflow_id,
 
 int spt_join_encode(uint8_t out[SPT_JOIN_PLAIN_LEN], const struct spt_join_plain *msg);
 int spt_join_decode(const uint8_t in[SPT_JOIN_PLAIN_LEN], struct spt_join_plain *msg);
+
+/* Context for the QUIC TLS exporter that binds a lane join to one connection. */
+int spt_quic_join_context(uint8_t out[SPT_QUIC_JOIN_CONTEXT_LEN], uint32_t lane_id,
+                          const uint8_t client_nonce[SPT_NONCE_LEN],
+                          const uint8_t server_nonce[SPT_NONCE_LEN],
+                          const uint8_t session_id[SPT_SESSION_ID_LEN],
+                          const uint8_t hello_hash[SPT_HASH_LEN]);
 
 int spt_transport_offer_encode(uint8_t out[SPT_TRANSPORT_OFFER_LEN],
                                const struct spt_transport_offer *msg);

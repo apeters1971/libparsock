@@ -35,7 +35,8 @@ int spt_header_decode(const uint8_t in[SPT_FRAME_HEADER_LEN], struct spt_header 
         return -1;
     if (in[4] != SPT_VERSION)
         return -1;
-    if (in[36] != SPT_PROTECTION_CONFIDENTIAL && in[36] != SPT_PROTECTION_AUTHENTICATED)
+    if (in[36] != SPT_PROTECTION_CONFIDENTIAL && in[36] != SPT_PROTECTION_AUTHENTICATED &&
+        in[36] != SPT_PROTECTION_TRANSPORT)
         return -1;
     if (in[37] != 0 || in[38] != 0 || in[39] != 0)
         return -1;
@@ -225,6 +226,22 @@ int spt_preface_decode(const uint8_t in[SPT_PREFACE_LEN], uint32_t *subflow_id,
     return 0;
 }
 
+int spt_quic_join_context(uint8_t out[SPT_QUIC_JOIN_CONTEXT_LEN], uint32_t lane_id,
+                          const uint8_t client_nonce[SPT_NONCE_LEN],
+                          const uint8_t server_nonce[SPT_NONCE_LEN],
+                          const uint8_t session_id[SPT_SESSION_ID_LEN],
+                          const uint8_t hello_hash[SPT_HASH_LEN])
+{
+    if (!out || !client_nonce || !server_nonce || !session_id || !hello_hash)
+        return -1;
+    ps_put_u32(out, lane_id);
+    memcpy(out + 4, client_nonce, SPT_NONCE_LEN);
+    memcpy(out + 4 + SPT_NONCE_LEN, server_nonce, SPT_NONCE_LEN);
+    memcpy(out + 4 + SPT_NONCE_LEN + SPT_NONCE_LEN, session_id, SPT_SESSION_ID_LEN);
+    memcpy(out + 4 + SPT_NONCE_LEN + SPT_NONCE_LEN + SPT_SESSION_ID_LEN, hello_hash, SPT_HASH_LEN);
+    return 0;
+}
+
 int spt_join_encode(uint8_t out[SPT_JOIN_PLAIN_LEN], const struct spt_join_plain *msg)
 {
     if (!out || !msg)
@@ -283,7 +300,8 @@ int spt_transport_offer_decode(const uint8_t in[SPT_TRANSPORT_OFFER_LEN],
         return -1;
     if (ps_get_u16(in + 2) != 0)
         return -1;
-    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC)
+    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC &&
+        in[0] != SPT_TRANSPORT_QUIC)
         return -1;
     memset(msg, 0, sizeof(*msg));
     msg->preference = in[0];
@@ -323,7 +341,8 @@ int spt_transport_select_decode(const uint8_t in[SPT_TRANSPORT_SELECT_LEN],
         return -1;
     if (in[1] != 0)
         return -1;
-    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC)
+    if (in[0] != SPT_TRANSPORT_TCP && in[0] != SPT_TRANSPORT_RDMA_RC &&
+        in[0] != SPT_TRANSPORT_QUIC)
         return -1;
     memset(msg, 0, sizeof(*msg));
     msg->transport = in[0];
@@ -336,6 +355,9 @@ int spt_transport_select_decode(const uint8_t in[SPT_TRANSPORT_SELECT_LEN],
     if (msg->transport == SPT_TRANSPORT_RDMA_RC &&
         (msg->lanes > 16 || msg->rdma_port == 0 || msg->send_depth < 2 || msg->recv_depth < 4 ||
          msg->send_depth > 256 || msg->recv_depth > 256))
+        return -1;
+    if (msg->transport == SPT_TRANSPORT_QUIC &&
+        (msg->lanes > 16 || msg->rdma_port == 0 || msg->send_depth != 0 || msg->recv_depth != 0))
         return -1;
     return 0;
 }

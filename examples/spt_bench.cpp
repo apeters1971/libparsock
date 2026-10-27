@@ -198,6 +198,8 @@ const char *transport_name(parsock::transport value)
 {
     if (value == parsock::transport::rdma)
         return "rdma";
+    if (value == parsock::transport::quic)
+        return "quic";
     if (value == parsock::transport::automatic)
         return "auto";
     return "tcp";
@@ -209,6 +211,8 @@ parsock::transport parse_transport(const std::string &text)
         return parsock::transport::tcp;
     if (text == "rdma")
         return parsock::transport::rdma;
+    if (text == "quic")
+        return parsock::transport::quic;
     if (text == "auto")
         return parsock::transport::automatic;
     throw std::runtime_error("unknown transport: " + text);
@@ -282,7 +286,7 @@ void usage()
         << "  spt_bench server [--cert CERT --key KEY] [--bind HOST] [--port N]\n"
         << "      [--aead aes-128-gcm|aes-256-gcm|chacha20-poly1305]\n"
         << "      [--sockets N] [--workers N] [--protection confidential|authenticated]\n"
-        << "      [--transport tcp|rdma|auto] [--tcp-fallback] [--rdma-device NAME]\n"
+        << "      [--transport tcp|rdma|quic|auto] [--tcp-fallback] [--rdma-device NAME]\n"
         << "      [--send FILE] [--recv FILE] [--bytes SIZE] [--seconds SEC]\n"
         << "      [--window SIZE] [--no-verify] [--hash] [--csv FILE] [--no-chart]\n"
         << "  spt_bench client HOST PORT [--cert CERT --key KEY] [same options]\n"
@@ -494,10 +498,12 @@ ephemeral_cert make_ephemeral_cert(const std::string &bind_host)
         X509_gmtime_adj(X509_getm_notAfter(cert.get()), 60 * 60 * 24 * 365) == nullptr ||
         X509_set_pubkey(cert.get(), key.get()) != 1)
         tls_fail("certificate");
-    X509_NAME *name = X509_get_subject_name(cert.get());
-    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name(X509_NAME_new(), X509_NAME_free);
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
                                    reinterpret_cast<const unsigned char *>("localhost"), -1, -1, 0) != 1 ||
-        X509_set_issuer_name(cert.get(), name) != 1)
+        X509_set_subject_name(cert.get(), name.get()) != 1 ||
+        X509_set_issuer_name(cert.get(), name.get()) != 1)
         tls_fail("certificate name");
 
     const std::string names = certificate_names(bind_host);
@@ -1144,6 +1150,9 @@ int run_endpoint(config cfg, bool server, const std::vector<std::string> &positi
     if (cfg.transport == parsock::transport::rdma && ps_rdma_supported() == 0)
         throw std::runtime_error(
             "RDMA transport is not in this build. Install librdmacm-devel and libibverbs-devel, then reconfigure and rebuild.");
+    if (cfg.transport == parsock::transport::quic && ps_quic_supported() == 0)
+        throw std::runtime_error(
+            "QUIC transport is not in this build. Install libngtcp2 and libngtcp2_crypto_ossl, then reconfigure and rebuild.");
 
     if (server) {
         if (!positionals.empty())

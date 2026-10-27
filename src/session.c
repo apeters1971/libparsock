@@ -7,6 +7,7 @@
 #include "endian.h"
 #include "log.h"
 #include "net.h"
+#include "quic.h"
 #include "rdma.h"
 #include "reassembly.h"
 #include "spt_wire.h"
@@ -49,6 +50,7 @@ enum {
     SF_OPEN_SENT,
     SF_WAIT_TCP,
     SF_WAIT_RDMA,
+    SF_WAIT_QUIC,
     SF_JOINING,
     SF_ACTIVE,
     SF_DRAINING,
@@ -151,6 +153,10 @@ struct subflow {
     int rdma_started;
     int rdma_up;
     int rdma_auth;
+    int quic;
+    int need_quic;
+    int quic_started;
+    int quic_up;
     uint32_t rdma_credit;
     uint32_t rdma_sent;
     uint32_t rdma_recv_posted;
@@ -316,6 +322,14 @@ struct ps_session {
     uint16_t rdma_port;
     struct ps_rdma *rdma;
     int rdma_serving;
+    struct ps_quic *quic;
+    uint16_t quic_port;
+    int quic_serving;
+    char *cert_file;
+    char *key_file;
+    char *ca_file;
+    int verify_peer;
+    int allow_insecure;
     int rdma_nhold;
     struct rdma_hold rdma_hold[RDMA_HOLD_MAX];
 };
@@ -324,6 +338,7 @@ static void fail_locked(struct ps_session *s, int err);
 static int queue_ctrl_locked(struct ps_session *s, uint16_t type,
                              const uint8_t *body, size_t len);
 static void refresh_write_locked(struct ps_session *s, struct subflow *sf);
+static size_t sf_wire(const struct subflow *sf, uint32_t plain);
 static int enqueue_record_locked(struct ps_session *s, struct subflow *sf,
                                  uint8_t type, uint16_t flags, uint64_t logical,
                                  const uint8_t *plain, uint32_t plain_len,
@@ -602,7 +617,7 @@ static void refresh_write_locked(struct ps_session *s, struct subflow *sf)
         ready = 1;
     int changed = sf->want_write != ready;
     sf->want_write = ready;
-    if (sf->rdma) {
+    if (sf->rdma || sf->quic) {
         if (changed && ready)
             queue_poke(s);
         return;
@@ -843,14 +858,84 @@ static int enqueue_record_batch_locked(struct ps_session *s, struct subflow *sf,
         fail_locked(s, PS_ERR_LIMIT);
         return -1;
     }
-    if (protection != SPT_PROTECTION_CONFIDENTIAL &&
-        protection != SPT_PROTECTION_AUTHENTICATED) {
+    uint32_t body_len = plain_len;
+    int quic_join = sf->quic && (type == SPT_REC_JOIN || type == SPT_REC_JOIN_ACK);
+    if (quic_join) {
+        if (plain_len != SPT_JOIN_PLAIN_LEN) {
+            fail_locked(s, PS_ERR_PROTO);
+            return -1;
+        }
+        body_len = plain_len + SPT_QUIC_JOIN_TAG_LEN;
+    }
+    if (sf->quic)
+        protection = SPT_PROTECTION_TRANSPORT;
+    if (sf->quic) {
+        if (protection != SPT_PROTECTION_TRANSPORT) {
+            fail_locked(s, PS_ERR_PROTO);
+            return -1;
+        }
+    } else if (protection != SPT_PROTECTION_CONFIDENTIAL &&
+               protection != SPT_PROTECTION_AUTHENTICATED) {
         fail_locked(s, PS_ERR_PROTO);
         return -1;
     }
-    if (type != SPT_REC_DATA && protection != SPT_PROTECTION_CONFIDENTIAL) {
+    if (!sf->quic && type != SPT_REC_DATA && protection != SPT_PROTECTION_CONFIDENTIAL) {
         fail_locked(s, PS_ERR_PROTO);
         return -1;
+    }
+    if (sf->quic) {
+        struct spt_header hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.version = SPT_VERSION;
+        hdr.type = type;
+        hdr.protection = protection;
+        hdr.flags = flags;
+        hdr.subflow_id = sf->id;
+        hdr.record_sequence = sf->send_seq;
+        hdr.logical_offset = logical;
+        hdr.plaintext_length = body_len;
+        size_t wire = sf_wire(sf, body_len);
+        uint8_t *frame = frame_get_locked(s, wire);
+        struct wire_slot *slot = (struct wire_slot *)calloc(1, sizeof(*slot));
+        if (!frame || !slot) {
+            frame_put_locked(s, frame, wire);
+            free(slot);
+            fail_locked(s, PS_ERR_NOMEM);
+            return -1;
+        }
+        spt_header_encode(frame, &hdr);
+        if (plain_len)
+            memcpy(frame + SPT_FRAME_HEADER_LEN, plain, plain_len);
+        if (quic_join) {
+            uint8_t context[SPT_QUIC_JOIN_CONTEXT_LEN];
+            uint8_t exporter[SPT_ROOT_LEN];
+            if (spt_quic_join_context(context, sf->id, sf->client_nonce, sf->server_nonce,
+                                      s->session_id, s->hello_hash) != 0 ||
+                ps_quic_exporter(s->quic, sf->id, context, sizeof(context), exporter) != 0 ||
+                spt_mac_sign(exporter, frame, plain, plain_len,
+                             frame + SPT_FRAME_HEADER_LEN + plain_len) != 0) {
+                OPENSSL_cleanse(exporter, sizeof(exporter));
+                frame_put_locked(s, frame, wire);
+                free(slot);
+                fail_locked(s, PS_ERR_AUTH);
+                return -1;
+            }
+            OPENSSL_cleanse(exporter, sizeof(exporter));
+        }
+        slot->seq = sf->send_seq;
+        slot->frame = frame;
+        slot->len = wire;
+        slot->ready = 1;
+        slot->ok = 1;
+        if (sf->out_tail)
+            sf->out_tail->next = slot;
+        else
+            sf->out_head = slot;
+        sf->out_tail = slot;
+        sf->out_bytes += wire;
+        sf->send_seq++;
+        refresh_write_locked(s, sf);
+        return 0;
     }
     struct gen_mat *g = gen_lookup(sf, sf->send_gen);
     if (!g) {
@@ -1068,19 +1153,43 @@ static void apply_slot_locked(struct ps_session *s, struct subflow *sf, struct p
         fail_locked(s, PS_ERR_PROTO);
         return;
     }
-    if (h->type != SPT_REC_DATA && h->protection != SPT_PROTECTION_CONFIDENTIAL) {
-        fail_locked(s, PS_ERR_PROTO);
-        return;
-    }
-    if (!spt_protection_accepts(s->min_protection, h->protection)) {
-        fail_locked(s, PS_ERR_PROTO);
-        return;
+    if (sf->quic) {
+        if (h->protection != SPT_PROTECTION_TRANSPORT) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+    } else {
+        if (h->type != SPT_REC_DATA && h->protection != SPT_PROTECTION_CONFIDENTIAL) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+        if (!spt_protection_accepts(s->min_protection, h->protection)) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
     }
     if (sf->recv_gen == 0 && h->record_sequence == 0 && h->key_generation == 0) {
         uint8_t expect = s->is_server ? SPT_REC_JOIN : SPT_REC_JOIN_ACK;
-        if (h->type != expect || h->plaintext_length != SPT_JOIN_PLAIN_LEN) {
+        uint32_t join_len = sf->quic ? SPT_JOIN_PLAIN_LEN + SPT_QUIC_JOIN_TAG_LEN : SPT_JOIN_PLAIN_LEN;
+        if (h->type != expect || h->plaintext_length != join_len) {
             fail_locked(s, PS_ERR_PROTO);
             return;
+        }
+        if (sf->quic) {
+            uint8_t context[SPT_QUIC_JOIN_CONTEXT_LEN];
+            uint8_t exporter[SPT_ROOT_LEN];
+            uint8_t aad[SPT_FRAME_HEADER_LEN];
+            if (spt_quic_join_context(context, sf->id, sf->client_nonce, sf->server_nonce,
+                                      s->session_id, s->hello_hash) != 0 ||
+                spt_header_encode(aad, h) != 0 ||
+                ps_quic_exporter(s->quic, sf->id, context, sizeof(context), exporter) != 0 ||
+                spt_mac_verify(exporter, aad, slot->plain, SPT_JOIN_PLAIN_LEN,
+                               slot->plain + SPT_JOIN_PLAIN_LEN) != 0) {
+                OPENSSL_cleanse(exporter, sizeof(exporter));
+                fail_locked(s, PS_ERR_AUTH);
+                return;
+            }
+            OPENSSL_cleanse(exporter, sizeof(exporter));
         }
         struct spt_join_plain join;
         if (spt_join_decode(slot->plain, &join) != 0) {
@@ -1228,6 +1337,13 @@ static void rx_compact(struct subflow *sf)
     sf->rx_off = 0;
 }
 
+static size_t sf_wire(const struct subflow *sf, uint32_t plain)
+{
+    if (sf->quic)
+        return SPT_FRAME_HEADER_LEN + (size_t)plain;
+    return spt_frame_wire_len(plain);
+}
+
 static int frame_ready(const struct subflow *sf)
 {
     if (!sf->rx || rx_live(sf) < SPT_FRAME_HEADER_LEN)
@@ -1235,7 +1351,7 @@ static int frame_ready(const struct subflow *sf)
     struct spt_header hdr;
     if (spt_header_decode(rx_ptr(sf), &hdr) != 0)
         return 1;
-    return rx_live(sf) >= spt_frame_wire_len(hdr.plaintext_length);
+    return rx_live(sf) >= sf_wire(sf, hdr.plaintext_length);
 }
 
 static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *budget)
@@ -1262,9 +1378,49 @@ static void parse_rx_locked(struct ps_session *s, struct subflow *sf, unsigned *
             fail_locked(s, PS_ERR_PROTO);
             break;
         }
-        size_t need = spt_frame_wire_len(hdr.plaintext_length);
+        size_t need = sf_wire(sf, hdr.plaintext_length);
         if (rx_live(sf) < need)
             break;
+        if (sf->quic) {
+            if (hdr.protection != SPT_PROTECTION_TRANSPORT || hdr.key_generation != 0 ||
+                hdr.record_sequence != sf->parse_seq) {
+                fail_locked(s, PS_ERR_PROTO);
+                break;
+            }
+            struct plain_slot *slot = (struct plain_slot *)calloc(1, sizeof(*slot));
+            size_t payload_cap = 0;
+            uint8_t *payload = spt_reassembly_get_buf(&s->reassembly,
+                                                      hdr.plaintext_length ? hdr.plaintext_length : 1,
+                                                      &payload_cap);
+            if (!slot || !payload) {
+                free(slot);
+                spt_reassembly_put_buf(&s->reassembly, payload, payload_cap);
+                fail_locked(s, PS_ERR_NOMEM);
+                break;
+            }
+            if (hdr.plaintext_length)
+                memcpy(payload, rx_ptr(sf) + SPT_FRAME_HEADER_LEN, hdr.plaintext_length);
+            sf->rx_off += need;
+            sf->parse_seq++;
+            slot->hdr = hdr;
+            slot->plain = payload;
+            slot->plain_cap = payload_cap;
+            slot->ready = 1;
+            slot->ok = 1;
+            slot->next = NULL;
+            if (sf->in_tail)
+                sf->in_tail->next = slot;
+            else
+                sf->in_head = slot;
+            sf->in_tail = slot;
+            (*budget)--;
+            apply_sf_locked(s, sf);
+            continue;
+        }
+        if (hdr.protection == SPT_PROTECTION_TRANSPORT) {
+            fail_locked(s, PS_ERR_PROTO);
+            break;
+        }
         struct gen_mat *g = NULL;
         if (hdr.key_generation == sf->recv_gen) {
             if (hdr.record_sequence != sf->parse_seq) {
@@ -1440,6 +1596,8 @@ static void on_rekey_locked(struct ps_session *s, uint32_t id, uint32_t gen, int
 
 static int start_rekey_locked(struct ps_session *s, struct subflow *sf)
 {
+    if (sf->quic)
+        return -1;
     if (!sf->keys_ready || sf->state != SF_ACTIVE)
         return -1;
     if (sf->rekey_wait || sf->local_announced)
@@ -1472,6 +1630,7 @@ static void open_one_locked(struct ps_session *s)
     sf->id = id;
     sf->state = SF_OPEN_SENT;
     sf->rdma = s->transport == SPT_TRANSPORT_RDMA_RC ? 1 : 0;
+    sf->quic = s->transport == SPT_TRANSPORT_QUIC ? 1 : 0;
     if (sf->rdma)
         sf->rdma_credit = s->rdma_recv_depth;
     if (RAND_bytes(sf->client_nonce, SPT_NONCE_LEN) != 1) {
@@ -1640,10 +1799,89 @@ static int select_rdma_locked(struct ps_session *s, uint32_t lanes, unsigned sen
     return 0;
 }
 
+static int select_quic_locked(struct ps_session *s, uint32_t lanes, uint16_t peer_port)
+{
+    if (lanes < 1 || lanes > PS_QUIC_MAX_LANES || s->quic)
+        return -1;
+    if (!s->is_server && peer_port == 0)
+        return -1;
+    struct ps_tls_config tls;
+    memset(&tls, 0, sizeof(tls));
+    tls.cert_file = s->cert_file;
+    tls.key_file = s->key_file;
+    tls.ca_file = s->ca_file;
+    tls.server_name = s->server_name;
+    tls.verify_peer = s->verify_peer;
+    tls.allow_insecure = s->allow_insecure;
+    struct ps_quic_cfg cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.is_server = s->is_server;
+    cfg.tls = &tls;
+    cfg.max_lanes = (unsigned)lanes;
+    struct sockaddr_storage local;
+    socklen_t llen = (socklen_t)sizeof(local);
+    memset(&local, 0, sizeof(local));
+    if (s->is_server && s->ctrl_fd >= 0 &&
+        getsockname(s->ctrl_fd, (struct sockaddr *)&local, &llen) == 0) {
+        cfg.bind_addr = (struct sockaddr *)&local;
+        cfg.bind_len = llen;
+    }
+    uint16_t bound = 0;
+    struct ps_quic *engine = ps_quic_open(&cfg, s->is_server ? &bound : NULL);
+    if (!engine) {
+        if (!ps_quic_available())
+            ps_notice("QUIC backend is not built into this library");
+        return -1;
+    }
+    if (s->is_server && bound == 0) {
+        ps_quic_close(engine);
+        return -1;
+    }
+    s->quic = engine;
+    s->quic_port = s->is_server ? bound : peer_port;
+    s->transport = SPT_TRANSPORT_QUIC;
+    s->transport_ready = 1;
+    s->expect = lanes;
+    s->max_sockets = lanes;
+    if (s->min_sockets > lanes)
+        s->min_sockets = lanes;
+    s->scale_mode = PS_SCALE_FIXED;
+    ps_log("transport quic lanes=%u port=%u", lanes, s->quic_port);
+    queue_poke(s);
+    return 0;
+}
+
 static void send_transport_offer_locked(struct ps_session *s)
 {
     if (s->offer_sent || s->is_server || s->state == PS_STATE_FAILED)
         return;
+    if (s->transport_pref == PS_TRANSPORT_QUIC) {
+        struct spt_transport_offer msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.preference = SPT_TRANSPORT_QUIC;
+        msg.fallback = s->allow_tcp_fallback ? 1 : 0;
+        msg.initial_lanes = s->expect ? s->expect : 1;
+        if (msg.initial_lanes > PS_QUIC_MAX_LANES)
+            msg.initial_lanes = PS_QUIC_MAX_LANES;
+        msg.max_lanes = s->max_sockets >= msg.initial_lanes ? s->max_sockets : msg.initial_lanes;
+        if (msg.max_lanes > PS_QUIC_MAX_LANES)
+            msg.max_lanes = PS_QUIC_MAX_LANES;
+        if (msg.max_lanes < msg.initial_lanes)
+            msg.max_lanes = msg.initial_lanes;
+        msg.send_depth = 0;
+        msg.recv_depth = 0;
+        msg.max_message = (uint32_t)spt_frame_wire_len((uint32_t)s->frame_size);
+        uint8_t body[SPT_TRANSPORT_OFFER_LEN];
+        if (spt_transport_offer_encode(body, &msg) != 0) {
+            fail_locked(s, PS_ERR_PROTO);
+            return;
+        }
+        if (queue_ctrl_locked(s, SPT_CTRL_TRANSPORT_OFFER, body, sizeof(body)) != 0)
+            return;
+        s->offer_sent = 1;
+        ps_log("quic offer lanes=%u fallback=%u", msg.initial_lanes, msg.fallback);
+        return;
+    }
     struct spt_transport_offer msg;
     memset(&msg, 0, sizeof(msg));
     msg.preference = SPT_TRANSPORT_RDMA_RC;
@@ -1677,10 +1915,15 @@ static void queue_transport_select_locked(struct ps_session *s)
     struct spt_transport_select sel;
     memset(&sel, 0, sizeof(sel));
     sel.transport = s->transport;
-    sel.rdma_port = s->transport == SPT_TRANSPORT_RDMA_RC ? s->rdma_port : 0;
+    if (s->transport == SPT_TRANSPORT_RDMA_RC)
+        sel.rdma_port = s->rdma_port;
+    else if (s->transport == SPT_TRANSPORT_QUIC)
+        sel.rdma_port = s->quic_port;
     sel.lanes = s->expect ? s->expect : 1;
-    sel.send_depth = s->rdma_send_depth;
-    sel.recv_depth = s->rdma_recv_depth;
+    if (s->transport == SPT_TRANSPORT_RDMA_RC) {
+        sel.send_depth = s->rdma_send_depth;
+        sel.recv_depth = s->rdma_recv_depth;
+    }
     uint8_t body[SPT_TRANSPORT_SELECT_LEN];
     if (spt_transport_select_encode(body, &sel) != 0) {
         fail_locked(s, PS_ERR_PROTO);
@@ -1705,10 +1948,22 @@ static void handle_transport_offer_locked(struct ps_session *s, const uint8_t *b
         fail_locked(s, PS_ERR_PROTO);
         return;
     }
+    int want_quic = msg.preference == SPT_TRANSPORT_QUIC;
     int want_rdma = msg.preference == SPT_TRANSPORT_RDMA_RC;
     int fallback = msg.fallback || s->allow_tcp_fallback;
     int opened = 0;
-    if (want_rdma && s->transport_pref != PS_TRANSPORT_TCP && ps_rdma_available()) {
+    if (want_quic && s->transport_pref == PS_TRANSPORT_QUIC && ps_quic_available()) {
+        uint32_t lanes = msg.initial_lanes;
+        if (s->expect && lanes > s->expect)
+            lanes = s->expect;
+        if (msg.max_lanes && lanes > msg.max_lanes)
+            lanes = msg.max_lanes;
+        if (lanes > PS_QUIC_MAX_LANES)
+            lanes = PS_QUIC_MAX_LANES;
+        if (lanes >= 1 && select_quic_locked(s, lanes, 0) == 0)
+            opened = 1;
+    } else if (want_rdma && s->transport_pref != PS_TRANSPORT_TCP &&
+               s->transport_pref != PS_TRANSPORT_QUIC && ps_rdma_available()) {
         unsigned send_d = clamp_rdma_depth(msg.send_depth, s->rdma_send_depth, 2);
         unsigned recv_d = clamp_rdma_depth(msg.recv_depth, s->rdma_recv_depth, 4);
         uint32_t lanes = msg.initial_lanes;
@@ -1724,7 +1979,7 @@ static void handle_transport_offer_locked(struct ps_session *s, const uint8_t *b
             opened = 1;
     }
     if (!opened) {
-        if (!want_rdma || fallback) {
+        if ((!want_rdma && !want_quic) || fallback) {
             select_tcp_locked(s);
         } else {
             fail_locked(s, PS_ERR_PROTO);
@@ -1746,11 +2001,22 @@ static void handle_transport_select_locked(struct ps_session *s, const uint8_t *
         return;
     }
     if (sel.transport == SPT_TRANSPORT_TCP) {
-        if (s->transport_pref == PS_TRANSPORT_RDMA_RC && !s->allow_tcp_fallback) {
+        if ((s->transport_pref == PS_TRANSPORT_RDMA_RC ||
+             s->transport_pref == PS_TRANSPORT_QUIC) &&
+            !s->allow_tcp_fallback) {
             fail_locked(s, PS_ERR_PROTO);
             return;
         }
         select_tcp_locked(s);
+        for (unsigned i = 0; i < s->expect; i++)
+            open_one_locked(s);
+        return;
+    }
+    if (sel.transport == SPT_TRANSPORT_QUIC) {
+        if (select_quic_locked(s, sel.lanes, sel.rdma_port) != 0) {
+            fail_locked(s, PS_ERR_IO);
+            return;
+        }
         for (unsigned i = 0; i < s->expect; i++)
             open_one_locked(s);
         return;
@@ -1917,7 +2183,9 @@ static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body
         return;
     }
     if (!s->transport_ready) {
-        if (s->transport_pref == PS_TRANSPORT_RDMA_RC && !s->allow_tcp_fallback) {
+        if ((s->transport_pref == PS_TRANSPORT_RDMA_RC ||
+             s->transport_pref == PS_TRANSPORT_QUIC) &&
+            !s->allow_tcp_fallback) {
             fail_locked(s, PS_ERR_PROTO);
             return;
         }
@@ -1948,7 +2216,11 @@ static void handle_subflow_open_locked(struct ps_session *s, const uint8_t *body
     sf->used = 1;
     sf->id = msg.subflow_id;
     sf->rdma = s->transport == SPT_TRANSPORT_RDMA_RC ? 1 : 0;
-    sf->state = sf->rdma ? SF_WAIT_RDMA : SF_WAIT_TCP;
+    sf->quic = s->transport == SPT_TRANSPORT_QUIC ? 1 : 0;
+    if (sf->quic)
+        sf->state = SF_WAIT_QUIC;
+    else
+        sf->state = sf->rdma ? SF_WAIT_RDMA : SF_WAIT_TCP;
     if (sf->rdma)
         sf->rdma_credit = s->rdma_recv_depth;
     memcpy(sf->client_nonce, msg.nonce, SPT_NONCE_LEN);
@@ -1996,6 +2268,13 @@ static void handle_subflow_accept_locked(struct ps_session *s, const uint8_t *bo
     }
     memcpy(sf->server_nonce, msg.nonce, SPT_NONCE_LEN);
     sf->server_nonce_set = 1;
+    if (sf->quic || s->transport == SPT_TRANSPORT_QUIC) {
+        sf->quic = 1;
+        sf->state = SF_WAIT_QUIC;
+        sf->need_quic = 1;
+        queue_poke(s);
+        return;
+    }
     if (sf->rdma || s->transport == SPT_TRANSPORT_RDMA_RC) {
         sf->rdma = 1;
         sf->rdma_credit = s->rdma_recv_depth;
@@ -2551,7 +2830,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
     s->io_timeout_ms = o.io_timeout_ms;
     s->advertised = s->recv_window;
     if (o.transport != PS_TRANSPORT_AUTO && o.transport != PS_TRANSPORT_TCP &&
-        o.transport != PS_TRANSPORT_RDMA_RC)
+        o.transport != PS_TRANSPORT_RDMA_RC && o.transport != PS_TRANSPORT_QUIC)
         o.transport = PS_TRANSPORT_TCP;
     s->transport_pref = o.transport;
     s->allow_tcp_fallback = o.allow_tcp_fallback ? 1 : 0;
@@ -2574,7 +2853,7 @@ static void normalize(struct ps_session *s, const struct ps_options *in)
         s->rdma_cq_budget = 128;
     if (o.rdma_device && o.rdma_device[0])
         s->rdma_device = dupstr(o.rdma_device);
-    if (s->transport_pref == PS_TRANSPORT_RDMA_RC)
+    if (s->transport_pref == PS_TRANSPORT_RDMA_RC || s->transport_pref == PS_TRANSPORT_QUIC)
         s->scale_mode = PS_SCALE_FIXED;
     if (!s->is_server && s->transport_pref == PS_TRANSPORT_TCP) {
         s->transport = SPT_TRANSPORT_TCP;
@@ -2601,6 +2880,12 @@ static void session_destroy(struct ps_session *s)
             int nr = ps_rdma_fds(s->rdma, rfds, 2);
             for (int i = 0; i < nr; i++)
                 s->io.stop_io(s->io.ctx, rfds[i]);
+        }
+        if (s->quic) {
+            int qfds[PS_QUIC_MAX_LANES];
+            int nq = ps_quic_fds(s->quic, qfds, PS_QUIC_MAX_LANES);
+            for (int i = 0; i < nq; i++)
+                s->io.stop_io(s->io.ctx, qfds[i]);
         }
     }
     if (s->ssl) {
@@ -2660,7 +2945,12 @@ static void session_destroy(struct ps_session *s)
     OPENSSL_cleanse(s->root, sizeof(s->root));
     ps_rdma_close(s->rdma);
     s->rdma = NULL;
+    ps_quic_close(s->quic);
+    s->quic = NULL;
     free(s->rdma_device);
+    free(s->cert_file);
+    free(s->key_file);
+    free(s->ca_file);
     free(s->server_name);
     free(s->tids);
     if (s->ctx)
@@ -2699,6 +2989,16 @@ ps_session_t *ps_session_create(int is_server, const struct ps_options *opt,
         s->io = *cbs;
     if (tls && tls->server_name)
         s->server_name = dupstr(tls->server_name);
+    if (tls) {
+        if (tls->cert_file)
+            s->cert_file = dupstr(tls->cert_file);
+        if (tls->key_file)
+            s->key_file = dupstr(tls->key_file);
+        if (tls->ca_file)
+            s->ca_file = dupstr(tls->ca_file);
+        s->verify_peer = tls->verify_peer;
+        s->allow_insecure = tls->allow_insecure;
+    }
     normalize(s, opt);
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->cv, NULL);
@@ -2934,6 +3234,13 @@ void ps_session_control_eof(ps_session_t *session)
     if (!session)
         return;
     lock_s(session);
+    /* The peer will not read another control record. Dropping the outbound
+       buffer is what lets close return; otherwise a late window update sits
+       here until the flush timeout. */
+    session->cout.off = 0;
+    session->cout.len = 0;
+    session->ctrl_want_read = 0;
+    session->ctrl_want_write = 0;
     if (session->state != PS_STATE_FAILED) {
         if (session->got_eos)
             session->state = PS_STATE_CLOSED;
@@ -3357,6 +3664,11 @@ int ps_session_next_timeout_ms(const ps_session_t *session)
             t = d > 1000 ? 1000 : (int)d;
         }
     }
+    if (s->quic) {
+        int qt = ps_quic_next_timeout_ms(s->quic);
+        if (qt < t)
+            t = qt;
+    }
     unlock_s(s);
     return t;
 }
@@ -3367,7 +3679,7 @@ static unsigned opening_count(const struct ps_session *s)
     for (uint32_t i = 0; i < s->sf_count; i++) {
         int st = s->sf[i].state;
         if (s->sf[i].used && (st == SF_OPEN_SENT || st == SF_WAIT_TCP || st == SF_WAIT_RDMA ||
-                              st == SF_JOINING))
+                              st == SF_WAIT_QUIC || st == SF_JOINING))
             n++;
     }
     return n;
@@ -4114,6 +4426,231 @@ int ps_session_rdma_service(ps_session_t *session)
     return err ? -err : PS_OK;
 }
 
+static void quic_send_join_locked(struct ps_session *s, struct subflow *sf)
+{
+    sf->quic_up = 1;
+    sf->keys_ready = 1;
+    sf->state = SF_JOINING;
+    struct spt_join_plain join;
+    memset(&join, 0, sizeof(join));
+    join.role = SPT_ROLE_CLIENT;
+    join.subflow_id = sf->id;
+    memcpy(join.session_id, s->session_id, SPT_SESSION_ID_LEN);
+    memcpy(join.client_nonce, sf->client_nonce, SPT_NONCE_LEN);
+    memcpy(join.server_nonce, sf->server_nonce, SPT_NONCE_LEN);
+    memcpy(join.hello_hash, s->hello_hash, SPT_HASH_LEN);
+    uint8_t raw[SPT_JOIN_PLAIN_LEN];
+    if (spt_join_encode(raw, &join) != 0 ||
+        enqueue_record_locked(s, sf, SPT_REC_JOIN, 0, 0, raw, SPT_JOIN_PLAIN_LEN,
+                              SPT_PROTECTION_CONFIDENTIAL) != 0)
+        fail_locked(s, PS_ERR_PROTO);
+}
+
+static int quic_pull_locked(struct ps_session *s, struct subflow *sf)
+{
+    if (!sf->rx && sf_alloc_rx(s, sf) != 0) {
+        fail_locked(s, PS_ERR_NOMEM);
+        return -1;
+    }
+    rx_compact(sf);
+    size_t room = sf->rx_cap - sf->rx_len;
+    if (room == 0)
+        return 0;
+    size_t n = 0;
+    int rc = ps_quic_recv(s->quic, sf->id, sf->rx + sf->rx_len, room, &n);
+    if (rc < 0) {
+        fail_locked(s, PS_ERR_IO);
+        return -1;
+    }
+    if (n == 0)
+        return 0;
+    sf->rx_len += n;
+    unsigned budget = s->max_poller_records ? s->max_poller_records : 32;
+    parse_rx_locked(s, sf, &budget);
+    return s->state == PS_STATE_FAILED ? -1 : 1;
+}
+
+static int quic_accept_unbound_locked(struct ps_session *s)
+{
+    unsigned ids[PS_QUIC_MAX_LANES];
+    int n = ps_quic_unbound(s->quic, ids, PS_QUIC_MAX_LANES);
+    int worked = 0;
+    size_t join_wire = SPT_FRAME_HEADER_LEN + SPT_JOIN_PLAIN_LEN + SPT_QUIC_JOIN_TAG_LEN;
+    for (int i = 0; i < n && s->state != PS_STATE_FAILED; i++) {
+        unsigned id = ids[i];
+        size_t len = ps_quic_unbound_len(s->quic, id);
+        if (len < SPT_FRAME_HEADER_LEN)
+            continue;
+        uint8_t hdrbuf[SPT_FRAME_HEADER_LEN];
+        struct spt_header hdr;
+        if (ps_quic_unbound_copy(s->quic, id, 0, hdrbuf, sizeof(hdrbuf)) != 0 ||
+            spt_header_decode(hdrbuf, &hdr) != 0 || hdr.type != SPT_REC_JOIN ||
+            hdr.protection != SPT_PROTECTION_TRANSPORT ||
+            hdr.plaintext_length != SPT_JOIN_PLAIN_LEN + SPT_QUIC_JOIN_TAG_LEN) {
+            ps_quic_drop(s->quic, id);
+            continue;
+        }
+        if (len < join_wire)
+            continue;
+        struct subflow *sf = sf_by_id(s, hdr.subflow_id);
+        if (!sf || !sf->quic || sf->quic_up || sf->state != SF_WAIT_QUIC) {
+            ps_quic_drop(s->quic, id);
+            continue;
+        }
+        uint8_t body[SPT_JOIN_PLAIN_LEN + SPT_QUIC_JOIN_TAG_LEN];
+        uint8_t context[SPT_QUIC_JOIN_CONTEXT_LEN];
+        uint8_t exporter[SPT_ROOT_LEN];
+        int verified = ps_quic_unbound_copy(s->quic, id, SPT_FRAME_HEADER_LEN, body, sizeof(body)) == 0 &&
+                       spt_quic_join_context(context, sf->id, sf->client_nonce, sf->server_nonce,
+                                             s->session_id, s->hello_hash) == 0 &&
+                       ps_quic_exporter_unbound(s->quic, id, context, sizeof(context), exporter) == 0 &&
+                       spt_mac_verify(exporter, hdrbuf, body, SPT_JOIN_PLAIN_LEN,
+                                      body + SPT_JOIN_PLAIN_LEN) == 0;
+        OPENSSL_cleanse(exporter, sizeof(exporter));
+        if (!verified || ps_quic_bind(s->quic, id, sf->id) != 0) {
+            ps_quic_drop(s->quic, id);
+            continue;
+        }
+        sf->quic_up = 1;
+        sf->keys_ready = 1;
+        worked = 1;
+        if (quic_pull_locked(s, sf) < 0)
+            return -1;
+    }
+    return worked;
+}
+
+static int quic_flush_locked(struct ps_session *s, struct subflow *sf)
+{
+    int any = 0;
+    while (s->state != PS_STATE_FAILED && sf->quic_up) {
+        struct wire_slot *slot = sf->out_head;
+        if (!slot || !slot->ready)
+            break;
+        if (!slot->ok) {
+            fail_locked(s, PS_ERR_CRYPTO);
+            return -1;
+        }
+        size_t left = slot->len - slot->off;
+        if (left == 0)
+            break;
+        size_t accepted = 0;
+        int rc = ps_quic_send(s->quic, sf->id, slot->frame + slot->off, left, &accepted);
+        if (rc < 0) {
+            fail_locked(s, PS_ERR_IO);
+            return -1;
+        }
+        if (rc > 0 || accepted == 0)
+            break;
+        slot->off += accepted;
+        any = 1;
+        if (slot->off != slot->len)
+            break;
+        sf->out_head = slot->next;
+        if (!sf->out_head)
+            sf->out_tail = NULL;
+        if (sf->out_bytes >= slot->len)
+            sf->out_bytes -= slot->len;
+        s->records_tx++;
+        frame_put_locked(s, slot->frame, slot->len);
+        free(slot);
+        try_end_locked(s, sf);
+        if (sf->tx_full && sf->out_bytes <= (s->sf_hi * 3) / 4)
+            sf->tx_full = 0;
+        if (!sf->tx_full && s->send_stalled)
+            pthread_cond_broadcast(&s->cv);
+        refresh_write_locked(s, sf);
+    }
+    return s->state == PS_STATE_FAILED ? -1 : any;
+}
+
+static int quic_drive_locked(struct ps_session *s)
+{
+    int worked = 0;
+    if (!s->is_server) {
+        for (uint32_t i = 0; i < s->sf_count && s->state != PS_STATE_FAILED; i++) {
+            struct subflow *sf = &s->sf[i];
+            if (!sf->used || !sf->quic || sf->quic_up || sf->state != SF_WAIT_QUIC)
+                continue;
+            if (!ps_quic_stream_ready(s->quic, sf->id))
+                continue;
+            quic_send_join_locked(s, sf);
+            worked = 1;
+        }
+    } else {
+        int accepted = quic_accept_unbound_locked(s);
+        if (accepted < 0)
+            return -1;
+        if (accepted > 0)
+            worked = 1;
+    }
+    if (s->state == PS_STATE_FAILED)
+        return -1;
+    for (uint32_t i = 0; i < s->sf_count && s->state != PS_STATE_FAILED; i++) {
+        struct subflow *sf = &s->sf[i];
+        if (!sf->used || !sf->quic || !sf->quic_up)
+            continue;
+        int pulled = quic_pull_locked(s, sf);
+        if (pulled < 0)
+            return -1;
+        if (pulled > 0)
+            worked = 1;
+        int flushed = quic_flush_locked(s, sf);
+        if (flushed < 0)
+            return -1;
+        if (flushed > 0)
+            worked = 1;
+    }
+    return s->state == PS_STATE_FAILED ? -1 : worked;
+}
+
+int ps_session_quic_service(ps_session_t *session)
+{
+    if (!session)
+        return -PS_ERR_INVAL;
+    lock_s(session);
+    if (!session->quic || session->quic_serving) {
+        int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
+        unlock_s(session);
+        return err ? -err : PS_OK;
+    }
+    session->quic_serving = 1;
+    struct ps_quic *quic = session->quic;
+    unlock_s(session);
+
+    for (int loops = 0; loops < 8; loops++) {
+        if (ps_quic_progress(quic) < 0) {
+            ps_session_fail(session, PS_ERR_IO);
+            break;
+        }
+        lock_s(session);
+        int worked = session->state == PS_STATE_FAILED ? -1 : quic_drive_locked(session);
+        int failed = session->state == PS_STATE_FAILED;
+        unlock_s(session);
+        if (worked < 0 || failed || !worked)
+            break;
+    }
+    if (ps_quic_progress(quic) < 0)
+        ps_session_fail(session, PS_ERR_IO);
+
+    lock_s(session);
+    int more = 0;
+    if (session->state != PS_STATE_FAILED && ps_quic_wants_write(quic))
+        more = 1;
+    for (uint32_t i = 0; i < session->sf_count && !more; i++) {
+        struct subflow *sf = &session->sf[i];
+        if (sf->quic_up && sf->out_head && sf->out_head->ready && sf->out_head->off < sf->out_head->len)
+            more = 1;
+    }
+    if (more && session->state != PS_STATE_FAILED)
+        queue_poke(session);
+    session->quic_serving = 0;
+    int err = session->state == PS_STATE_FAILED ? session->err : PS_OK;
+    unlock_s(session);
+    dispatch(session);
+    return err ? -err : PS_OK;
+}
+
 int ps_embed_service(ps_session_t *session)
 {
     if (!session)
@@ -4122,9 +4659,11 @@ int ps_embed_service(ps_session_t *session)
     uint32_t connect_ids[PS_MAX_SUBFLOWS];
     uint32_t rdma_ids[PS_MAX_SUBFLOWS];
     uint8_t rdma_tokens[PS_MAX_SUBFLOWS][SPT_RDMA_TOKEN_LEN];
+    uint32_t quic_ids[PS_QUIC_MAX_LANES];
     int nclose = 0;
     int nconn = 0;
     int nrdma = 0;
+    int nquic = 0;
     lock_s(session);
     for (uint32_t i = 0; i < session->sf_count; i++) {
         struct subflow *sf = &session->sf[i];
@@ -4154,11 +4693,19 @@ int ps_embed_service(ps_session_t *session)
             OPENSSL_cleanse(token, sizeof(token));
             nrdma++;
         }
+        if (sf->need_quic && !sf->quic_started && session->quic && session->peer_len &&
+            session->quic_port && nquic < PS_QUIC_MAX_LANES) {
+            sf->need_quic = 0;
+            sf->quic_started = 1;
+            quic_ids[nquic++] = sf->id;
+        }
     }
     struct sockaddr_storage peer = session->peer;
     socklen_t peer_len = session->peer_len;
     uint16_t rdma_port = session->rdma_port;
     struct ps_rdma *rdma = session->rdma;
+    uint16_t quic_port = session->quic_port;
+    struct ps_quic *quic = session->quic;
     int failed = session->state == PS_STATE_FAILED;
     unlock_s(session);
     dispatch(session);
@@ -4206,8 +4753,19 @@ int ps_embed_service(ps_session_t *session)
             OPENSSL_cleanse(rdma_tokens[i], SPT_RDMA_TOKEN_LEN);
         }
     }
+    if (!failed && quic) {
+        for (int i = 0; i < nquic; i++) {
+            struct sockaddr_storage addr = peer;
+            if (peer_len == 0 ||
+                ps_addr_set_port((struct sockaddr *)&addr, peer_len, quic_port) != 0 ||
+                ps_quic_connect(quic, quic_ids[i], (struct sockaddr *)&addr, peer_len) != 0)
+                ps_session_fail(session, PS_ERR_IO);
+        }
+    }
     ps_session_progress(session);
-    return ps_session_rdma_service(session);
+    int rd = ps_session_rdma_service(session);
+    int qd = ps_session_quic_service(session);
+    return rd ? rd : qd;
 }
 
 unsigned ps_session_io_lanes(const ps_session_t *session)
@@ -4285,6 +4843,24 @@ int ps_session_watches(const ps_session_t *session, struct ps_watch *out, int ma
             n++;
         }
     }
+    if (s->quic && n < max) {
+        int qfds[PS_QUIC_MAX_LANES];
+        int nq = ps_quic_fds(s->quic, qfds, PS_QUIC_MAX_LANES);
+        int wr = ps_quic_wants_write(s->quic);
+        for (int i = 0; i < nq && n < max; i++) {
+            int seen = 0;
+            for (int j = 0; j < n; j++) {
+                if (out[j].fd == qfds[i])
+                    seen = 1;
+            }
+            if (seen || qfds[i] < 0)
+                continue;
+            out[n].fd = qfds[i];
+            out[n].want_read = 1;
+            out[n].want_write = wr;
+            n++;
+        }
+    }
     unlock_s(s);
     return n;
 }
@@ -4312,6 +4888,25 @@ int ps_session_is_rdma_fd(const ps_session_t *session, int fd)
         int nr = ps_rdma_fds(s->rdma, rfds, 2);
         for (int i = 0; i < nr; i++) {
             if (rfds[i] == fd)
+                yes = 1;
+        }
+    }
+    unlock_s(s);
+    return yes;
+}
+
+int ps_session_is_quic_fd(const ps_session_t *session, int fd)
+{
+    if (!session || fd < 0)
+        return 0;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    int yes = 0;
+    if (s->quic) {
+        int qfds[PS_QUIC_MAX_LANES];
+        int nq = ps_quic_fds(s->quic, qfds, PS_QUIC_MAX_LANES);
+        for (int i = 0; i < nq; i++) {
+            if (qfds[i] == fd)
                 yes = 1;
         }
     }

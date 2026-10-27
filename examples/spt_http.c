@@ -183,13 +183,16 @@ static int write_self_signed(const char *cert_path, const char *key_path)
         openssl_fail("certificate");
         goto done;
     }
-    X509_NAME *name = X509_get_subject_name(cert);
-    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"localhost", -1, -1,
+    X509_NAME *name = X509_NAME_new();
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"localhost", -1, -1,
                                    0) != 1 ||
-        X509_set_issuer_name(cert, name) != 1) {
+        X509_set_subject_name(cert, name) != 1 || X509_set_issuer_name(cert, name) != 1) {
+        X509_NAME_free(name);
         openssl_fail("certificate name");
         goto done;
     }
+    X509_NAME_free(name);
     X509V3_CTX ext;
     X509V3_set_ctx_nodb(&ext);
     X509V3_set_ctx(&ext, cert, cert, NULL, NULL, 0);

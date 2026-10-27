@@ -194,13 +194,16 @@ static int lane_owns(const struct io_lane *lane, int fd)
 static void lane_fill(struct io_lane *lane, int *read_again)
 {
     struct ps_runtime *rt = lane->rt;
-    if (lane->index == 0)
+    if (lane->index == 0) {
         ps_session_rdma_service(rt->session);
+        ps_session_quic_service(rt->session);
+    }
     struct ps_watch watches[PS_MAX_SUBFLOWS + 4];
     int nw = ps_session_watches(rt->session, watches, PS_MAX_SUBFLOWS + 4);
     int again_left = 0;
     for (int i = 0; i < nw; i++) {
-        if (ps_session_is_rdma_fd(rt->session, watches[i].fd))
+        if (ps_session_is_rdma_fd(rt->session, watches[i].fd) ||
+            ps_session_is_quic_fd(rt->session, watches[i].fd))
             continue;
         if (!lane_owns(lane, watches[i].fd))
             continue;
@@ -247,8 +250,9 @@ static void *runtime_main(void *arg)
         pfds[np].revents = 0;
         np++;
         for (int i = 0; i < nw; i++) {
-            int rdma_fd = ps_session_is_rdma_fd(rt->session, watches[i].fd);
-            if (rdma_fd) {
+            int shared = ps_session_is_rdma_fd(rt->session, watches[i].fd) ||
+                         ps_session_is_quic_fd(rt->session, watches[i].fd);
+            if (shared) {
                 if (lane->index != 0)
                     continue;
             } else if (!lane_owns(lane, watches[i].fd)) {
@@ -286,6 +290,8 @@ static void *runtime_main(void *arg)
             if (ev & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
                 if (ps_session_is_rdma_fd(rt->session, fd))
                     ps_session_rdma_service(rt->session);
+                else if (ps_session_is_quic_fd(rt->session, fd))
+                    ps_session_quic_service(rt->session);
                 else if (control)
                     ps_on_readable(rt->session, fd);
                 else {
@@ -296,7 +302,9 @@ static void *runtime_main(void *arg)
                 }
             }
             if (ev & POLLOUT) {
-                if (control || ps_session_is_connecting(rt->session, fd))
+                if (ps_session_is_quic_fd(rt->session, fd))
+                    ps_session_quic_service(rt->session);
+                else if (control || ps_session_is_connecting(rt->session, fd))
                     ps_on_writable(rt->session, fd);
                 else
                     ps_session_flush(rt->session, fd, 4u * 1024u * 1024u);

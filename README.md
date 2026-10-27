@@ -4,21 +4,21 @@ Userspace proof of concept for **Secure Parallel Transport (SPT/0.1)**.
 
 One reliable, ordered, bidirectional byte stream is carried on several ordinary TCP sockets. A TLS 1.3 control connection authenticates the peers and stays up for the session. Data sockets carry custom AEAD records, not TLS records. The protocol core does not own the event loop: the same session runs under a library poll thread or under an external poller.
 
-This tree is a research implementation. It is not a production transport, it does not modify the kernel or OpenSSL, and it has not had a security review. The wire format is experimental and is written down in [docs/spt-0.1.md](docs/spt-0.1.md). An optional RDMA RC SEND/RECV data plane is described in [docs/spt-rdma.md](docs/spt-rdma.md) and is built when librdmacm and libibverbs are present. The default transport is TCP.
+This tree is a research implementation. It is not a production transport, it does not modify the kernel or OpenSSL, and it has not had a security review. The wire format is experimental and is written down in [docs/spt-0.1.md](docs/spt-0.1.md). An optional RDMA RC SEND/RECV data plane is described in [docs/spt-rdma.md](docs/spt-rdma.md) and is built when librdmacm and libibverbs are present. An optional QUIC data plane is described in [docs/spt-quic.md](docs/spt-quic.md) and is built when libngtcp2 and libngtcp2_crypto_ossl are present. The default transport is TCP.
 
 ## Build
 
-OpenSSL 3 is required. On macOS with Homebrew:
+OpenSSL 3 or newer is required. The QUIC backend uses the same OpenSSL that `libngtcp2_crypto_ossl` was built against. On Homebrew that is currently OpenSSL 4, and CMake selects `/opt/homebrew/opt/openssl@4` when that prefix exists. Otherwise it uses OpenSSL 3.
 
 ```sh
-cmake -S . -B build -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
 The default build type is Release. An existing `build` directory configured without a build type stays unoptimized until it is reconfigured with `-DCMAKE_BUILD_TYPE=Release`. That unoptimized build caps the transfer around a few Gb/s on one thread, so extra sockets do not add rate.
 
-The CMake build looks for Homebrew OpenSSL 3 on Apple automatically when that prefix exists. AddressSanitizer:
+AddressSanitizer:
 
 ```sh
 cmake -S . -B build-asan -DPARSOCK_ASAN=ON
@@ -40,6 +40,7 @@ ctest --test-dir build-asan --output-on-failure
 - An embedded readiness API (`ps_on_readable`, `ps_on_writable`, `ps_embed_service`) for an external poller
 - Optional crypto worker threads, independent of the socket count
 - Optional RDMA Reliable Connected SEND/RECV data plane on Linux (`ps_options.transport`)
+- Optional QUIC data plane: one ngtcp2 connection and one bidirectional stream per lane (`PS_TRANSPORT_QUIC`)
 
 Out of scope for this tree: a kernel client, `sptd`, native XRootD integration, cross-socket retransmission, and io_uring.
 
@@ -93,6 +94,7 @@ A terminal shows transmit and receive rate, with a sparkline of about the last m
 - `include/spt_wire.h` — experimental wire codec and key schedule
 - `docs/spt-0.1.md` — experimental TCP wire specification
 - `docs/spt-rdma.md` — proposed RDMA transport extension
+- `docs/spt-quic.md` — QUIC transport extension (ngtcp2)
 - `src/session.c` — protocol core
 - `src/drive.c` — TLS pump and readiness entry points
 - `src/standalone.c` — poll thread, listener, and blocking API

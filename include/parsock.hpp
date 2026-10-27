@@ -57,7 +57,8 @@ enum class protection : int {
 enum class transport : int {
     automatic = PS_TRANSPORT_AUTO,
     tcp = PS_TRANSPORT_TCP,
-    rdma = PS_TRANSPORT_RDMA_RC
+    rdma = PS_TRANSPORT_RDMA_RC,
+    quic = PS_TRANSPORT_QUIC
 };
 
 enum class errc : int {
@@ -273,7 +274,7 @@ public:
     options &transport(transport preference)
     {
         opt_.transport = static_cast<ps_transport_t>(preference);
-        if (preference == transport::rdma)
+        if (preference == transport::rdma || preference == transport::quic)
             opt_.allow_tcp_fallback = 0;
         if (preference == transport::automatic)
             opt_.allow_tcp_fallback = 1;
@@ -556,6 +557,8 @@ public:
         int selected = ps_connection_transport(conn_);
         if (selected == PS_TRANSPORT_RDMA_RC)
             return parsock::transport::rdma;
+        if (selected == PS_TRANSPORT_QUIC)
+            return parsock::transport::quic;
         return parsock::transport::tcp;
     }
 

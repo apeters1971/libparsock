@@ -5,6 +5,8 @@
 
 #include <string.h>
 
+#include <arpa/inet.h>
+
 #include <openssl/err.h>
 
 static int base_ctx(SSL_CTX *ctx)
@@ -92,6 +94,23 @@ SSL_CTX *ps_tls_client_ctx(const struct ps_tls_config *cfg)
     return ctx;
 }
 
+int ps_tls_set_peer_name(SSL *ssl, const char *server_name)
+{
+    if (!ssl || !server_name || !server_name[0])
+        return -1;
+    if (SSL_set_tlsext_host_name(ssl, server_name) != 1)
+        return -1;
+#if OPENSSL_VERSION_MAJOR >= 4
+    unsigned char addr[16];
+    int v6 = strchr(server_name, ':') != NULL;
+    if (inet_pton(v6 ? AF_INET6 : AF_INET, server_name, addr) == 1)
+        return SSL_set1_ipaddr(ssl, server_name) == 1 ? 0 : -1;
+    return SSL_set1_dnsname(ssl, server_name) == 1 ? 0 : -1;
+#else
+    return SSL_set1_host(ssl, server_name) == 1 ? 0 : -1;
+#endif
+}
+
 SSL *ps_tls_wrap(SSL_CTX *ctx, int fd, int is_server, const char *server_name)
 {
     SSL *ssl = SSL_new(ctx);
@@ -108,9 +127,9 @@ SSL *ps_tls_wrap(SSL_CTX *ctx, int fd, int is_server, const char *server_name)
         SSL_set_accept_state(ssl);
     } else {
         SSL_set_connect_state(ssl);
-        if (server_name && server_name[0]) {
-            SSL_set_tlsext_host_name(ssl, server_name);
-            SSL_set1_host(ssl, server_name);
+        if (server_name && server_name[0] && ps_tls_set_peer_name(ssl, server_name) != 0) {
+            SSL_free(ssl);
+            return NULL;
         }
     }
     return ssl;
