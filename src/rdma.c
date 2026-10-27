@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -35,7 +36,7 @@ struct rdma_lane {
     struct rdma_cm_id *id;
     uint8_t token[32];
     uint8_t *mem;
-    struct ibv_mr *mr;
+    struct ibv_mr *mrs[512];
     size_t stride;
     unsigned char send_used[256];
     unsigned char recv_held[256];
@@ -126,27 +127,96 @@ static int ensure_device(struct ps_rdma *r, struct ibv_context *ctx)
     return 0;
 }
 
+static size_t host_page(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    if (page < 4096)
+        page = 4096;
+    return (size_t)page;
+}
+
+static void format_rlim(rlim_t value, char *out, size_t n)
+{
+    if (value == RLIM_INFINITY)
+        snprintf(out, n, "unlimited");
+    else
+        snprintf(out, n, "%llu", (unsigned long long)value);
+}
+
+/* ibv_reg_mr pins pages and charges them to RLIMIT_MEMLOCK. A 256 KiB frame
+   with the default queue depths is about 20 MiB, above the usual 64 KiB soft
+   limit. Raise it when the hard limit allows. */
+static void raise_memlock(size_t bytes)
+{
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_MEMLOCK, &lim) != 0)
+        return;
+    if (lim.rlim_cur == RLIM_INFINITY || lim.rlim_cur >= (rlim_t)bytes)
+        return;
+    struct rlimit up;
+    up.rlim_cur = RLIM_INFINITY;
+    up.rlim_max = RLIM_INFINITY;
+    if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
+        return;
+    if (lim.rlim_max > lim.rlim_cur) {
+        up.rlim_cur = lim.rlim_max;
+        up.rlim_max = lim.rlim_max;
+        if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
+            return;
+    }
+    char soft[32];
+    char hard[32];
+    format_rlim(lim.rlim_cur, soft, sizeof(soft));
+    format_rlim(lim.rlim_max, hard, sizeof(hard));
+    ps_notice("rdma memlock soft %s hard %s is below %zu bytes", soft, hard, bytes);
+}
+
 static int setup_buffers(struct ps_rdma *r, struct rdma_lane *ln)
 {
     if (ln->buffers)
         return 0;
-    size_t stride = (r->message_bytes + 63u) & ~(size_t)63u;
-    size_t bytes = stride * (size_t)(r->send_depth + r->recv_depth);
-    size_t alloc = (bytes + 4095u) & ~(size_t)4095u;
-    uint8_t *mem = (uint8_t *)aligned_alloc(4096, alloc);
-    if (!mem)
+    /* One MR per slot. irdma returns ENOMEM for a single registration of the
+       whole queue (about 20 MiB). Each slot stays under one page-aligned frame. */
+    size_t page = host_page();
+    size_t stride = (r->message_bytes + page - 1u) & ~(page - 1u);
+    unsigned nslots = r->send_depth + r->recv_depth;
+    if (nslots > 512)
         return -1;
-    memset(mem, 0, alloc);
-    struct ibv_mr *mr = ibv_reg_mr(r->pd, mem, alloc, IBV_ACCESS_LOCAL_WRITE);
-    if (!mr) {
-        ps_notice("rdma memory registration failed: %s", strerror(errno));
-        free(mem);
+    size_t alloc = stride * (size_t)nslots;
+    raise_memlock(alloc);
+    void *raw = NULL;
+    int arc = posix_memalign(&raw, page, alloc);
+    if (arc != 0) {
+        ps_notice("rdma buffer allocation failed: %s (%zu bytes)", strerror(arc), alloc);
         return -1;
     }
+    uint8_t *mem = (uint8_t *)raw;
+    memset(mem, 0, alloc);
+    for (unsigned i = 0; i < nslots; i++) {
+        ln->mrs[i] = ibv_reg_mr(r->pd, mem + stride * (size_t)i, stride, IBV_ACCESS_LOCAL_WRITE);
+        if (!ln->mrs[i]) {
+            int saved = errno;
+            struct rlimit lim;
+            memset(&lim, 0, sizeof(lim));
+            getrlimit(RLIMIT_MEMLOCK, &lim);
+            char soft[32];
+            char hard[32];
+            format_rlim(lim.rlim_cur, soft, sizeof(soft));
+            format_rlim(lim.rlim_max, hard, sizeof(hard));
+            ps_notice("rdma memory registration failed: %s (region %u of %u, %zu bytes, %zu bytes total, memlock soft %s hard %s)",
+                      strerror(saved), i, nslots, stride, alloc, soft, hard);
+            for (unsigned j = 0; j < i; j++) {
+                ibv_dereg_mr(ln->mrs[j]);
+                ln->mrs[j] = NULL;
+            }
+            free(mem);
+            return -1;
+        }
+    }
     ln->mem = mem;
-    ln->mr = mr;
     ln->stride = stride;
     ln->buffers = 1;
+    ps_notice("rdma registered %zu bytes in %u regions", alloc, nslots);
     return 0;
 }
 
@@ -156,7 +226,7 @@ static int post_recv_slot(struct ps_rdma *r, struct rdma_lane *ln, unsigned slot
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)(ln->mem + ln->stride * (r->send_depth + slot));
     sge.length = (uint32_t)r->message_bytes;
-    sge.lkey = ln->mr->lkey;
+    sge.lkey = ln->mrs[r->send_depth + slot]->lkey;
     struct ibv_recv_wr wr;
     struct ibv_recv_wr *bad = NULL;
     memset(&wr, 0, sizeof(wr));
@@ -203,9 +273,11 @@ static int create_lane_qp(struct ps_rdma *r, struct rdma_lane *ln)
 
 static void free_lane_buffers(struct rdma_lane *ln)
 {
-    if (ln->mr) {
-        ibv_dereg_mr(ln->mr);
-        ln->mr = NULL;
+    for (unsigned i = 0; i < 512; i++) {
+        if (ln->mrs[i]) {
+            ibv_dereg_mr(ln->mrs[i]);
+            ln->mrs[i] = NULL;
+        }
     }
     free(ln->mem);
     ln->mem = NULL;
@@ -729,7 +801,7 @@ int ps_rdma_send(struct ps_rdma *rdma, uint32_t lane, const void *data, size_t l
             memset(&sge, 0, sizeof(sge));
             sge.addr = (uintptr_t)dst;
             sge.length = (uint32_t)len;
-            sge.lkey = ln->mr->lkey;
+            sge.lkey = ln->mrs[slot]->lkey;
             struct ibv_send_wr wr;
             struct ibv_send_wr *bad = NULL;
             memset(&wr, 0, sizeof(wr));
