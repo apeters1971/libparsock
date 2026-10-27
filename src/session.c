@@ -325,6 +325,7 @@ struct ps_session {
     struct ps_quic *quic;
     uint16_t quic_port;
     int quic_serving;
+    int quic_tx_pending;
     char *cert_file;
     char *key_file;
     char *ca_file;
@@ -3886,11 +3887,13 @@ static void drain_user_tx(struct ps_session *s)
 {
     if (s->nworkers == 0 || s->workers_stopped) {
         run_ready_work(s, -1);
-        dispatch(s);
     } else {
         while (step_worker_job(s)) {
         }
     }
+    /* QUIC records are queued without a crypto job, so the poke they raise
+       reaches the I/O lane only through this call. */
+    dispatch(s);
     lock_s(s);
     while (s->user_tx_inflight > 0)
         pthread_cond_wait(&s->cv, &s->mu);
@@ -4691,7 +4694,34 @@ int ps_session_quic_service(ps_session_t *session)
     }
     session->quic_serving = 1;
     struct ps_quic *quic = session->quic;
+    /* Lanes are opened here, inside the one section that may touch the
+       QUIC engine. The control socket's lane also services QUIC after each
+       control read, so opening a lane elsewhere races with that pass. */
+    uint32_t quic_ids[PS_QUIC_MAX_LANES];
+    int nquic = 0;
+    if (!session->is_server && session->peer_len && session->quic_port) {
+        for (uint32_t i = 0; i < session->sf_count && nquic < PS_QUIC_MAX_LANES; i++) {
+            struct subflow *sf = &session->sf[i];
+            if (sf->used && sf->need_quic && !sf->quic_started) {
+                sf->need_quic = 0;
+                sf->quic_started = 1;
+                quic_ids[nquic++] = sf->id;
+            }
+        }
+    }
+    struct sockaddr_storage peer = session->peer;
+    socklen_t peer_len = session->peer_len;
+    uint16_t quic_port = session->quic_port;
     unlock_s(session);
+
+    for (int i = 0; i < nquic; i++) {
+        struct sockaddr_storage addr = peer;
+        if (ps_addr_set_port((struct sockaddr *)&addr, peer_len, quic_port) != 0 ||
+            ps_quic_connect(quic, quic_ids[i], (struct sockaddr *)&addr, peer_len) != 0) {
+            ps_session_fail(session, PS_ERR_IO);
+            break;
+        }
+    }
 
     for (int loops = 0; loops < 8; loops++) {
         if (ps_quic_progress(quic) < 0) {
@@ -4708,6 +4738,10 @@ int ps_session_quic_service(ps_session_t *session)
 
     lock_s(session);
     int more = 0;
+    int tx_pending = ps_quic_tx_pending(quic);
+    if (session->quic_tx_pending && !tx_pending)
+        pthread_cond_broadcast(&session->cv);
+    session->quic_tx_pending = tx_pending;
     if (session->state != PS_STATE_FAILED && ps_quic_wants_write(quic))
         more = 1;
     for (uint32_t i = 0; i < session->sf_count && !more; i++) {
@@ -4732,11 +4766,9 @@ int ps_embed_service(ps_session_t *session)
     uint32_t connect_ids[PS_MAX_SUBFLOWS];
     uint32_t rdma_ids[PS_MAX_SUBFLOWS];
     uint8_t rdma_tokens[PS_MAX_SUBFLOWS][SPT_RDMA_TOKEN_LEN];
-    uint32_t quic_ids[PS_QUIC_MAX_LANES];
     int nclose = 0;
     int nconn = 0;
     int nrdma = 0;
-    int nquic = 0;
     lock_s(session);
     for (uint32_t i = 0; i < session->sf_count; i++) {
         struct subflow *sf = &session->sf[i];
@@ -4766,19 +4798,11 @@ int ps_embed_service(ps_session_t *session)
             OPENSSL_cleanse(token, sizeof(token));
             nrdma++;
         }
-        if (sf->need_quic && !sf->quic_started && session->quic && session->peer_len &&
-            session->quic_port && nquic < PS_QUIC_MAX_LANES) {
-            sf->need_quic = 0;
-            sf->quic_started = 1;
-            quic_ids[nquic++] = sf->id;
-        }
     }
     struct sockaddr_storage peer = session->peer;
     socklen_t peer_len = session->peer_len;
     uint16_t rdma_port = session->rdma_port;
     struct ps_rdma *rdma = session->rdma;
-    uint16_t quic_port = session->quic_port;
-    struct ps_quic *quic = session->quic;
     int failed = session->state == PS_STATE_FAILED;
     unlock_s(session);
     dispatch(session);
@@ -4824,15 +4848,6 @@ int ps_embed_service(ps_session_t *session)
                                 rdma_tokens[i]) != 0)
                 ps_session_fail(session, PS_ERR_IO);
             OPENSSL_cleanse(rdma_tokens[i], SPT_RDMA_TOKEN_LEN);
-        }
-    }
-    if (!failed && quic) {
-        for (int i = 0; i < nquic; i++) {
-            struct sockaddr_storage addr = peer;
-            if (peer_len == 0 ||
-                ps_addr_set_port((struct sockaddr *)&addr, peer_len, quic_port) != 0 ||
-                ps_quic_connect(quic, quic_ids[i], (struct sockaddr *)&addr, peer_len) != 0)
-                ps_session_fail(session, PS_ERR_IO);
         }
     }
     ps_session_progress(session);
@@ -5222,6 +5237,10 @@ static int pending_out_locked(const struct ps_session *s)
 {
     if (s->cout.len > s->cout.off || s->inline_head || s->jobs_inflight)
         return 1;
+    /* QUIC keeps a copy of each record until the peer acknowledges it.
+       Closing the socket earlier discards that tail. */
+    if (s->quic && s->state != PS_STATE_CLOSED && ps_quic_tx_pending(s->quic))
+        return 1;
     for (uint32_t i = 0; i < s->sf_count; i++) {
         const struct subflow *sf = &s->sf[i];
         if (!sf->used)
@@ -5240,7 +5259,8 @@ int ps_session_wait_flush(ps_session_t *session, uint32_t timeout_ms)
     clock_gettime(CLOCK_REALTIME, &ts);
     ps_add_ms(&ts, timeout_ms);
     lock_s(session);
-    while (pending_out_locked(session) && session->state != PS_STATE_FAILED) {
+    while (pending_out_locked(session) && session->state != PS_STATE_FAILED &&
+           session->state != PS_STATE_CLOSED) {
         int rc = pthread_cond_timedwait(&session->cv, &session->mu, &ts);
         if (rc == ETIMEDOUT || deadline_reached(&ts))
             break;

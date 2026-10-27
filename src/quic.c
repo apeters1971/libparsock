@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -304,7 +305,7 @@ static int random_cid(ngtcp2_cid *cid)
 
 static void conn_clear(struct qconn *c)
 {
-    if (!c->used && !c->conn && !c->ssl)
+    if (!c->used && !c->conn && !c->ssl && c->fd < 0 && !c->rx && !c->tx)
         return;
     if (c->conn)
         ngtcp2_conn_del(c->conn);
@@ -1033,6 +1034,20 @@ int ps_quic_wants_write(const struct ps_quic *quic)
     return 0;
 }
 
+int ps_quic_tx_pending(const struct ps_quic *quic)
+{
+    if (!quic)
+        return 0;
+    for (unsigned i = 0; i < quic->max_lanes; i++) {
+        const struct qconn *c = &quic->conns[i];
+        if (!c->used || !c->bound || c->dead)
+            continue;
+        if (c->tx_len > 0 || c->pending_off < c->pending_n)
+            return 1;
+    }
+    return 0;
+}
+
 int ps_quic_wants_read(const struct ps_quic *quic, int fd)
 {
     if (!quic || fd < 0)
@@ -1094,7 +1109,8 @@ int ps_quic_connect(struct ps_quic *quic, uint32_t lane, const struct sockaddr *
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->parent = quic;
-    c->used = 1;
+    /* used is set last, once the socket and ngtcp2 state exist. Other
+       lanes list QUIC descriptors while this runs. */
     c->bound = 1;
     c->lane = lane;
     c->is_server = 0;
@@ -1167,6 +1183,8 @@ int ps_quic_connect(struct ps_quic *quic, uint32_t lane, const struct sockaddr *
         conn_clear(c);
         return -1;
     }
+    atomic_thread_fence(memory_order_release);
+    c->used = 1;
     return 0;
 }
 
@@ -1380,6 +1398,12 @@ int ps_quic_wants_read(const struct ps_quic *quic, int fd)
 {
     (void)quic;
     (void)fd;
+    return 0;
+}
+
+int ps_quic_tx_pending(const struct ps_quic *quic)
+{
+    (void)quic;
     return 0;
 }
 

@@ -38,6 +38,8 @@ int ps_quic_fds(struct ps_quic *quic, int *fds, int max);
 int ps_quic_wants_write(const struct ps_quic *quic);
 /* 0 when this socket's receive buffer already holds a full window. */
 int ps_quic_wants_read(const struct ps_quic *quic, int fd);
+/* 1 while a lane still holds stream bytes the peer has not acknowledged. */
+int ps_quic_tx_pending(const struct ps_quic *quic);
 /* Read sockets, run timers, and transmit. 0 on success, -1 if an
    established lane has failed. A handshake that never becomes a lane
    is discarded here. */
