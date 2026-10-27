@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
 #include "quic.h"
 
 #include "log.h"
@@ -23,8 +26,13 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 
-#define QUIC_WINDOW (1u << 20)
+/* Flow-control window and the rx/tx buffer that holds it. A 1 MiB
+   window refills once per acknowledgement delay, which measured
+   about 40 MB/s. 16 MiB leaves room for a millisecond of delay. */
+#define QUIC_WINDOW (16u << 20)
 #define QUIC_CIDLEN 18u
+#define QUIC_BURST 32
+#define QUIC_WRITE_MAX 1024
 
 struct qconn {
     int used;
@@ -58,8 +66,11 @@ struct qconn {
     size_t tx_len;
     size_t tx_sent;
     uint64_t tx_ack;
-    uint8_t pending[2048];
-    size_t pending_len;
+    uint8_t pending[QUIC_BURST][1500];
+    uint16_t pending_len[QUIC_BURST];
+    int pending_n;
+    int pending_off;
+    int need_write;
     struct ps_quic *parent;
 };
 
@@ -248,7 +259,19 @@ static void fill_params(ngtcp2_transport_params *params)
     params->initial_max_streams_uni = 0;
     params->max_idle_timeout = 120 * NGTCP2_SECONDS;
     params->max_udp_payload_size = 65527;
+    params->max_ack_delay = NGTCP2_MILLISECONDS;
     params->disable_active_migration = 1;
+}
+
+static void tune_settings(ngtcp2_settings *settings, ngtcp2_tstamp now)
+{
+    settings->initial_ts = now;
+    settings->handshake_timeout = 15 * NGTCP2_SECONDS;
+    settings->no_pmtud = 1;
+    settings->initial_rtt = NGTCP2_MILLISECONDS;
+    settings->ack_thresh = 1;
+    settings->max_window = QUIC_WINDOW;
+    settings->max_stream_window = QUIC_WINDOW;
 }
 
 static int random_cid(ngtcp2_cid *cid)
@@ -366,14 +389,91 @@ static int send_udp(struct qconn *c, int fd, const uint8_t *data, size_t len)
     return (size_t)n == len ? 0 : -1;
 }
 
+static int send_many(struct qconn *c, int fd, uint8_t pkts[][1500], const uint16_t *lens, int n,
+                     int *sent_out)
+{
+    int sent = 0;
+    if (sent_out)
+        *sent_out = 0;
+    if (n <= 0)
+        return 0;
+#if defined(__linux__)
+    struct mmsghdr msgs[QUIC_BURST];
+    struct iovec iov[QUIC_BURST];
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < n; i++) {
+        iov[i].iov_base = pkts[i];
+        iov[i].iov_len = lens[i];
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        if (!c->connected) {
+            msgs[i].msg_hdr.msg_name = &c->remote;
+            msgs[i].msg_hdr.msg_namelen = c->remote_len;
+        }
+    }
+    while (sent < n) {
+        int rc = sendmmsg(fd, msgs + sent, (unsigned)(n - sent), 0);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            return -1;
+        }
+        if (rc == 0)
+            break;
+        sent += rc;
+    }
+#else
+    while (sent < n) {
+        int rc = send_udp(c, fd, pkts[sent], lens[sent]);
+        if (rc > 0)
+            break;
+        if (rc < 0)
+            return -1;
+        sent++;
+    }
+#endif
+    if (sent_out)
+        *sent_out = sent;
+    return sent < n ? 1 : 0;
+}
+
 static int flush_pending(struct qconn *c, int fd)
 {
-    if (c->pending_len == 0)
+    if (c->pending_off >= c->pending_n)
         return 0;
-    int rc = send_udp(c, fd, c->pending, c->pending_len);
-    if (rc == 0)
-        c->pending_len = 0;
-    return rc;
+    int sent = 0;
+    int rc = send_many(c, fd, c->pending + c->pending_off, c->pending_len + c->pending_off,
+                        c->pending_n - c->pending_off, &sent);
+    if (rc < 0)
+        return -1;
+    c->pending_off += sent;
+    if (c->pending_off >= c->pending_n) {
+        c->pending_off = 0;
+        c->pending_n = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int emit_bufs(struct qconn *c, int fd, uint8_t bufs[][1500], const uint16_t *lens, int nbuf)
+{
+    int sent = 0;
+    int rc = send_many(c, fd, bufs, lens, nbuf, &sent);
+    if (rc < 0)
+        return -1;
+    if (rc > 0) {
+        int left = nbuf - sent;
+        for (int k = 0; k < left; k++) {
+            memcpy(c->pending[k], bufs[sent + k], lens[sent + k]);
+            c->pending_len[k] = lens[sent + k];
+        }
+        c->pending_off = 0;
+        c->pending_n = left;
+        return 1;
+    }
+    return 0;
 }
 
 static void credit_read(struct qconn *c, size_t n)
@@ -429,8 +529,12 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
             return kill_conn(c, 1);
         }
     }
-    uint8_t buf[1500];
-    for (int i = 0; i < 16; i++) {
+    c->need_write = 0;
+    uint8_t bufs[QUIC_BURST][1500];
+    uint16_t lens[QUIC_BURST];
+    int nbuf = 0;
+    int hit_cap = 1;
+    for (int i = 0; i < QUIC_WRITE_MAX; i++) {
         int64_t sid = -1;
         const uint8_t *data = NULL;
         size_t datalen = 0;
@@ -440,39 +544,54 @@ static int write_conn(struct qconn *c, int fd, ngtcp2_tstamp ts)
             datalen = c->tx_len - c->tx_sent;
         }
         ngtcp2_ssize accepted = -1;
-        ngtcp2_ssize nwrite = ngtcp2_conn_write_stream(c->conn, NULL, NULL, buf, sizeof(buf),
-                                                       &accepted, NGTCP2_WRITE_STREAM_FLAG_NONE, sid,
-                                                       data, datalen, ts);
+        ngtcp2_ssize nwrite =
+            ngtcp2_conn_write_stream(c->conn, NULL, NULL, bufs[nbuf], sizeof(bufs[nbuf]), &accepted,
+                                     NGTCP2_WRITE_STREAM_FLAG_NONE, sid, data, datalen, ts);
         if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
             accepted = -1;
-            nwrite = ngtcp2_conn_write_stream(c->conn, NULL, NULL, buf, sizeof(buf), &accepted,
-                                              NGTCP2_WRITE_STREAM_FLAG_NONE, -1, NULL, 0, ts);
+            nwrite = ngtcp2_conn_write_stream(c->conn, NULL, NULL, bufs[nbuf], sizeof(bufs[nbuf]),
+                                              &accepted, NGTCP2_WRITE_STREAM_FLAG_NONE, -1, NULL, 0,
+                                              ts);
         }
-        if (nwrite == 0)
+        if (nwrite == 0) {
+            hit_cap = 0;
             break;
+        }
         if (nwrite < 0) {
             ps_notice("quic write: %s", ngtcp2_strerror((int)nwrite));
+            c->dead = 1;
+            return kill_conn(c, 1);
+        }
+        if ((size_t)nwrite > sizeof(bufs[nbuf])) {
             c->dead = 1;
             return kill_conn(c, 1);
         }
         if (accepted > 0)
             c->tx_sent += (size_t)accepted;
         ngtcp2_conn_update_pkt_tx_time(c->conn, ts);
-        int rc = send_udp(c, fd, buf, (size_t)nwrite);
-        if (rc > 0) {
-            if ((size_t)nwrite > sizeof(c->pending)) {
+        lens[nbuf++] = (uint16_t)nwrite;
+        if (nbuf == QUIC_BURST) {
+            int rc = emit_bufs(c, fd, bufs, lens, nbuf);
+            if (rc < 0) {
                 c->dead = 1;
                 return kill_conn(c, 1);
             }
-            memcpy(c->pending, buf, (size_t)nwrite);
-            c->pending_len = (size_t)nwrite;
-            return 1;
+            nbuf = 0;
+            if (rc > 0)
+                return 1;
         }
+    }
+    if (nbuf > 0) {
+        int rc = emit_bufs(c, fd, bufs, lens, nbuf);
         if (rc < 0) {
             c->dead = 1;
             return kill_conn(c, 1);
         }
+        if (rc > 0)
+            return 1;
     }
+    if (hit_cap)
+        c->need_write = 1;
     return 0;
 }
 
@@ -612,9 +731,7 @@ static int accept_server(struct ps_quic *q, const uint8_t *pkt, size_t pktlen,
     fill_callbacks(&cb, 1);
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
-    settings.initial_ts = ts;
-    settings.handshake_timeout = 15 * NGTCP2_SECONDS;
-    settings.no_pmtud = 1;
+    tune_settings(&settings, ts);
     ngtcp2_transport_params params;
     fill_params(&params);
     params.original_dcid = hd.dcid;
@@ -653,8 +770,60 @@ static int feed_packet(struct ps_quic *q, struct qconn *hint, const uint8_t *pkt
     return read_into(c, &path.path, pkt, pktlen, ts);
 }
 
+static int pump_one(struct ps_quic *q, struct qconn *hint, const uint8_t *buf, size_t n,
+                    const struct sockaddr *peer, socklen_t plen, ngtcp2_tstamp ts)
+{
+    if (n == 0)
+        return 0;
+    int rc = feed_packet(q, hint, buf, n, peer, plen, ts);
+    if (rc < 0)
+        return -1;
+    if (hint && !hint->used)
+        return 1;
+    return 0;
+}
+
 static int pump_fd(struct ps_quic *q, struct qconn *hint, int fd, ngtcp2_tstamp ts)
 {
+#if defined(__linux__)
+    uint8_t bufs[QUIC_BURST][2048];
+    struct mmsghdr msgs[QUIC_BURST];
+    struct iovec iov[QUIC_BURST];
+    struct sockaddr_storage peers[QUIC_BURST];
+    for (;;) {
+        memset(msgs, 0, sizeof(msgs));
+        for (int i = 0; i < QUIC_BURST; i++) {
+            iov[i].iov_base = bufs[i];
+            iov[i].iov_len = sizeof(bufs[i]);
+            msgs[i].msg_hdr.msg_iov = &iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            msgs[i].msg_hdr.msg_name = &peers[i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(peers[i]);
+        }
+        int n = recvmmsg(fd, msgs, QUIC_BURST, 0, NULL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return 0;
+            if (hint) {
+                hint->dead = 1;
+                return kill_conn(hint, 1);
+            }
+            return -1;
+        }
+        for (int i = 0; i < n; i++) {
+            int rc = pump_one(q, hint, bufs[i], msgs[i].msg_len, (struct sockaddr *)&peers[i],
+                              msgs[i].msg_hdr.msg_namelen, ts);
+            if (rc < 0)
+                return -1;
+            if (rc > 0)
+                return 0;
+        }
+        if (n < QUIC_BURST)
+            return 0;
+    }
+#else
     uint8_t buf[65535];
     for (;;) {
         struct sockaddr_storage peer;
@@ -671,14 +840,13 @@ static int pump_fd(struct ps_quic *q, struct qconn *hint, int fd, ngtcp2_tstamp 
             }
             return -1;
         }
-        if (n == 0)
-            continue;
-        int rc = feed_packet(q, hint, buf, (size_t)n, (struct sockaddr *)&peer, plen, ts);
+        int rc = pump_one(q, hint, buf, (size_t)n, (struct sockaddr *)&peer, plen, ts);
         if (rc < 0)
             return -1;
-        if (hint && !hint->used)
+        if (rc > 0)
             return 0;
     }
+#endif
 }
 
 int ps_quic_available(void)
@@ -808,7 +976,7 @@ int ps_quic_wants_write(const struct ps_quic *quic)
         const struct qconn *c = &quic->conns[i];
         if (!c->used || c->dead)
             continue;
-        if (c->pending_len || (c->stream_ready && c->tx_sent < c->tx_len))
+        if (c->pending_off < c->pending_n || c->need_write)
             return 1;
     }
     return 0;
@@ -921,9 +1089,7 @@ int ps_quic_connect(struct ps_quic *quic, uint32_t lane, const struct sockaddr *
     fill_callbacks(&cb, 0);
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
-    settings.initial_ts = qnow();
-    settings.handshake_timeout = 15 * NGTCP2_SECONDS;
-    settings.no_pmtud = 1;
+    tune_settings(&settings, qnow());
     ngtcp2_transport_params params;
     fill_params(&params);
     if (ngtcp2_conn_client_new(&c->conn, &dcid, &scid, &path.path, NGTCP2_PROTO_VER_V1, &cb,
