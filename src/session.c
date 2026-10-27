@@ -3722,23 +3722,116 @@ static void rdma_mark_up_locked(struct ps_session *s, uint32_t id)
         refresh_write_locked(s, sf);
 }
 
-static int rdma_append_locked(struct ps_session *s, uint32_t lane, const uint8_t *data, size_t len)
+/* One RDMA SEND is one SPT record. Stage it straight into a crypto job.
+   Returns 0 with *job_out set, 1 when the receive slot must be held, or -1. */
+static int rdma_stage_frame_locked(struct ps_session *s, uint32_t lane, const uint8_t *data, size_t len,
+                                   struct crypto_job **job_out)
 {
+    if (job_out)
+        *job_out = NULL;
     struct subflow *sf = sf_by_id(s, lane);
     size_t max = spt_frame_wire_len((uint32_t)s->frame_size);
     if (!sf || !sf->rdma || !data || len < SPT_FRAME_HEADER_LEN || len > max) {
         fail_locked(s, PS_ERR_PROTO);
         return -1;
     }
-    if (!sf->rx || sf->read_paused)
+    if (sf->read_paused || sf->in_flight >= RX_PIPELINE)
         return 1;
-    if (sf->rx_cap - sf->rx_len < len && sf->rx_off > 0)
-        rx_compact(sf);
-    if (sf->rx_cap - sf->rx_len < len)
-        return 1;
-    memcpy(sf->rx + sf->rx_len, data, len);
-    sf->rx_len += len;
+    struct spt_header hdr;
+    if (spt_header_decode(data, &hdr) != 0) {
+        fail_locked(s, PS_ERR_PROTO);
+        return -1;
+    }
+    if (hdr.subflow_id != sf->id || hdr.plaintext_length > s->frame_size ||
+        spt_frame_wire_len(hdr.plaintext_length) != len) {
+        fail_locked(s, PS_ERR_PROTO);
+        return -1;
+    }
+    struct gen_mat *g = NULL;
+    if (hdr.key_generation == sf->recv_gen) {
+        if (hdr.record_sequence != sf->parse_seq) {
+            fail_locked(s, PS_ERR_PROTO);
+            return -1;
+        }
+        g = gen_lookup(sf, hdr.key_generation);
+    } else if (hdr.key_generation == sf->recv_gen + 1 && hdr.record_sequence == 0) {
+        g = gen_lookup(sf, hdr.key_generation);
+        if (!g) {
+            fail_locked(s, PS_ERR_CRYPTO);
+            return -1;
+        }
+        sf->recv_gen = hdr.key_generation;
+        sf->parse_seq = 0;
+    } else {
+        fail_locked(s, PS_ERR_PROTO);
+        return -1;
+    }
+    if (!g) {
+        fail_locked(s, PS_ERR_CRYPTO);
+        return -1;
+    }
+    struct plain_slot *slot = (struct plain_slot *)calloc(1, sizeof(*slot));
+    struct crypto_job *job = (struct crypto_job *)calloc(1, sizeof(*job));
+    size_t payload_cap = 0;
+    uint8_t *payload = spt_reassembly_get_buf(&s->reassembly,
+                                              hdr.plaintext_length ? hdr.plaintext_length : 1, &payload_cap);
+    if (!slot || !job || !payload) {
+        free(slot);
+        free(job);
+        spt_reassembly_put_buf(&s->reassembly, payload, payload_cap);
+        fail_locked(s, PS_ERR_NOMEM);
+        return -1;
+    }
+    job->copy_src = hdr.plaintext_length ? (data + SPT_FRAME_HEADER_LEN) : NULL;
+    memcpy(job->tag_store, data + SPT_FRAME_HEADER_LEN + hdr.plaintext_length, SPT_TAG_LEN);
+    sf->parse_seq++;
+    slot->hdr = hdr;
+    slot->plain = payload;
+    slot->plain_cap = payload_cap;
+    if (sf->in_tail)
+        sf->in_tail->next = slot;
+    else
+        sf->in_head = slot;
+    sf->in_tail = slot;
+    sf->in_flight++;
+    job->op_open = 1;
+    job->mac = hdr.protection == SPT_PROTECTION_AUTHENTICATED;
+    job->alg = s->aead;
+    if (job->mac) {
+        memcpy(job->key, g->recv_mac, SPT_KEY_LEN);
+        memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
+    } else {
+        memcpy(job->key, g->recv_key, SPT_KEY_LEN);
+        memcpy(job->iv, g->recv_iv, SPT_IV_LEN);
+    }
+    job->seq = hdr.record_sequence;
+    spt_header_encode(job->aad, &hdr);
+    job->in = hdr.plaintext_length ? payload : NULL;
+    job->in_len = hdr.plaintext_length;
+    job->out = hdr.plaintext_length ? payload : NULL;
+    job->keep_in = 1;
+    job->tag = job->tag_store;
+    job->pslot = slot;
+    job->sf = sf;
+    job->aead_slot = -1;
+    job->aead_ctx = sf_take_aead(sf, 1, &job->aead_slot, &job->aead_owned);
+    if (!job->aead_ctx) {
+        free_job(job);
+        fail_locked(s, PS_ERR_NOMEM);
+        return -1;
+    }
+    s->jobs_inflight++;
+    if (job_out)
+        *job_out = job;
     return 0;
+}
+
+static void rdma_copy_job(struct crypto_job *job)
+{
+    if (!job || !job->copy_src || !job->in_len)
+        return;
+    memcpy(job->in, job->copy_src, job->in_len);
+    job->copy_src = NULL;
 }
 
 static void rdma_note_recv_locked(struct ps_session *s, struct subflow *sf)
@@ -3747,8 +3840,8 @@ static void rdma_note_recv_locked(struct ps_session *s, struct subflow *sf)
         return;
     sf->rdma_recv_posted++;
     uint32_t step = s->rdma_recv_depth / 4;
-    if (step < 8)
-        step = 8;
+    if (step < 1)
+        step = 1;
     if (sf->rdma_recv_posted < sf->rdma_credit_sent ||
         sf->rdma_recv_posted - sf->rdma_credit_sent < step)
         return;
@@ -3774,7 +3867,8 @@ static int rdma_flush_holds_locked(struct ps_session *s)
     int i = 0;
     while (i < s->rdma_nhold && s->state != PS_STATE_FAILED) {
         struct rdma_hold *h = &s->rdma_hold[i];
-        int rc = rdma_append_locked(s, h->lane, h->data, h->len);
+        struct crypto_job *job = NULL;
+        int rc = rdma_stage_frame_locked(s, h->lane, h->data, h->len, &job);
         if (rc < 0)
             return -1;
         if (rc > 0)
@@ -3784,8 +3878,10 @@ static int rdma_flush_holds_locked(struct ps_session *s)
         memmove(h, h + 1, (size_t)(s->rdma_nhold - i - 1) * sizeof(*h));
         s->rdma_nhold--;
         unlock_s(s);
+        rdma_copy_job(job);
         int recycled = ps_rdma_recycle(s->rdma, lane, slot);
         lock_s(s);
+        submit_batch_locked(s, job, job, 1);
         if (recycled != 0) {
             fail_locked(s, PS_ERR_IO);
             return -1;
@@ -3923,7 +4019,8 @@ int ps_session_rdma_service(ps_session_t *session)
                 stop = 1;
             } else if (ev[i].type == PS_RDMA_EV_RECV) {
                 lock_s(session);
-                int rc = rdma_append_locked(session, ev[i].lane, ev[i].data, ev[i].len);
+                struct crypto_job *job = NULL;
+                int rc = rdma_stage_frame_locked(session, ev[i].lane, ev[i].data, ev[i].len, &job);
                 if (rc < 0) {
                     unlock_s(session);
                     stop = 1;
@@ -3949,12 +4046,16 @@ int ps_session_rdma_service(ps_session_t *session)
                 uint32_t lane = ev[i].lane;
                 unsigned slot = ev[i].slot;
                 unlock_s(session);
-                if (ps_rdma_recycle(rdma, lane, slot) != 0) {
-                    ps_session_fail(session, PS_ERR_IO);
+                rdma_copy_job(job);
+                int recycled = ps_rdma_recycle(rdma, lane, slot);
+                lock_s(session);
+                submit_batch_locked(session, job, job, 1);
+                if (recycled != 0) {
+                    fail_locked(session, PS_ERR_IO);
+                    unlock_s(session);
                     stop = 1;
                     break;
                 }
-                lock_s(session);
                 rdma_note_recv_locked(session, sf_by_id(session, lane));
                 unlock_s(session);
             }

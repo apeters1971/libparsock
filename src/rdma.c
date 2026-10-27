@@ -518,45 +518,54 @@ static int poll_cq(struct ps_rdma *r, struct ps_rdma_event *ev, int *n, int max,
     if (!r->cq)
         return 0;
     drain_notify(r);
+    struct ibv_wc wc[16];
     while (*budget > 0 && *n < max) {
-        struct ibv_wc wc;
-        int got = ibv_poll_cq(r->cq, 1, &wc);
+        int want = 16;
+        if ((unsigned)want > *budget)
+            want = (int)*budget;
+        if (want > max - *n)
+            want = max - *n;
+        if (want < 1)
+            break;
+        int got = ibv_poll_cq(r->cq, want, wc);
         if (got == 0)
             break;
         if (got < 0) {
             ps_notice("rdma poll cq failed");
             return -1;
         }
-        (*budget)--;
-        unsigned kind = 0;
-        unsigned lane = 0;
-        unsigned slot = 0;
-        unpack_wr(wc.wr_id, &kind, &lane, &slot);
-        if (lane >= PS_MAX_SUBFLOWS) {
-            ps_notice("rdma completion for an unknown lane");
-            return emit(ev, n, max, PS_RDMA_EV_ERROR, 0, NULL, 0, 0);
+        for (int i = 0; i < got; i++) {
+            (*budget)--;
+            unsigned kind = 0;
+            unsigned lane = 0;
+            unsigned slot = 0;
+            unpack_wr(wc[i].wr_id, &kind, &lane, &slot);
+            if (lane >= PS_MAX_SUBFLOWS) {
+                ps_notice("rdma completion for an unknown lane");
+                return emit(ev, n, max, PS_RDMA_EV_ERROR, 0, NULL, 0, 0);
+            }
+            struct rdma_lane *ln = &r->lanes[lane];
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                ps_notice("rdma completion status %s lane %u", ibv_wc_status_str(wc[i].status), lane);
+                ln->state = LANE_DEAD;
+                if (kind == 1 && slot < 256)
+                    ln->send_used[slot] = 0;
+                return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
+            }
+            if (kind == 1) {
+                if (slot < 256)
+                    ln->send_used[slot] = 0;
+                continue;
+            }
+            if (kind != 2 || slot >= r->recv_depth || !ln->mem) {
+                ln->state = LANE_DEAD;
+                return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
+            }
+            ln->recv_held[slot] = 1;
+            const uint8_t *data = ln->mem + ln->stride * (r->send_depth + slot);
+            if (emit(ev, n, max, PS_RDMA_EV_RECV, lane, data, wc[i].byte_len, slot) != 0)
+                return -1;
         }
-        struct rdma_lane *ln = &r->lanes[lane];
-        if (wc.status != IBV_WC_SUCCESS) {
-            ps_notice("rdma completion status %s lane %u", ibv_wc_status_str(wc.status), lane);
-            ln->state = LANE_DEAD;
-            if (kind == 1 && slot < 256)
-                ln->send_used[slot] = 0;
-            return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
-        }
-        if (kind == 1) {
-            if (slot < 256)
-                ln->send_used[slot] = 0;
-            continue;
-        }
-        if (kind != 2 || slot >= r->recv_depth || !ln->mem) {
-            ln->state = LANE_DEAD;
-            return emit(ev, n, max, PS_RDMA_EV_ERROR, lane, NULL, 0, 0);
-        }
-        ln->recv_held[slot] = 1;
-        const uint8_t *data = ln->mem + ln->stride * (r->send_depth + slot);
-        if (emit(ev, n, max, PS_RDMA_EV_RECV, lane, data, wc.byte_len, slot) != 0)
-            return -1;
     }
     return 0;
 }
