@@ -482,6 +482,7 @@ static void credit_read(struct qconn *c, size_t n)
         return;
     ngtcp2_conn_extend_max_stream_offset(c->conn, c->stream_id, n);
     ngtcp2_conn_extend_max_offset(c->conn, n);
+    c->need_write = 1;
 }
 
 static int kill_conn(struct qconn *c, int bound_is_fatal)

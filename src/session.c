@@ -4705,8 +4705,6 @@ int ps_session_quic_service(ps_session_t *session)
         if (worked < 0 || failed || !worked)
             break;
     }
-    if (ps_quic_progress(quic) < 0)
-        ps_session_fail(session, PS_ERR_IO);
 
     lock_s(session);
     int more = 0;
