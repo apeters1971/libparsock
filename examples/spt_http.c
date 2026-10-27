@@ -31,9 +31,10 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage:\n"
-            "  spt_http server cert key [port] [public]\n"
-            "  spt_http client cert key host port bytes [public] [noverify]\n"
-            "noverify skips the body pattern check.\n"
+            "  spt_http server cert key [port] [public] [tcp|rdma|quic]\n"
+            "  spt_http client cert key host port bytes [public] [noverify] [tcp|rdma|quic]\n"
+            "noverify skips the body pattern check. The default transport is tcp.\n"
+            "rdma and quic do not fall back to tcp; the server must select the same transport.\n"
             "A missing server certificate and key are written as a self-signed pair.\n");
 }
 
@@ -231,6 +232,39 @@ done:
     return rc;
 }
 
+static int parse_transport(const char *text, ps_transport_t *out)
+{
+    if (strcmp(text, "tcp") == 0)
+        *out = PS_TRANSPORT_TCP;
+    else if (strcmp(text, "rdma") == 0)
+        *out = PS_TRANSPORT_RDMA_RC;
+    else if (strcmp(text, "quic") == 0)
+        *out = PS_TRANSPORT_QUIC;
+    else
+        return 0;
+    return 1;
+}
+
+static void apply_transport(struct ps_options *opt, ps_transport_t transport)
+{
+    opt->transport = transport;
+    if (transport == PS_TRANSPORT_RDMA_RC || transport == PS_TRANSPORT_QUIC)
+        opt->allow_tcp_fallback = 0;
+}
+
+static int transport_available(ps_transport_t transport)
+{
+    if (transport == PS_TRANSPORT_RDMA_RC && !ps_rdma_supported()) {
+        fprintf(stderr, "spt_http: RDMA is not available in this build\n");
+        return 0;
+    }
+    if (transport == PS_TRANSPORT_QUIC && !ps_quic_supported()) {
+        fprintf(stderr, "spt_http: QUIC is not available in this build\n");
+        return 0;
+    }
+    return 1;
+}
+
 static int ensure_server_cert(const char *cert_path, const char *key_path)
 {
     int have_cert = access(cert_path, R_OK) == 0;
@@ -397,7 +431,7 @@ static int run_client(struct ps_options *opt, const char *host, uint16_t port,
 {
     ps_connection_t *conn = ps_connect(host, port, opt);
     if (!conn) {
-        fprintf(stderr, "spt_http: connect failed\n");
+        fprintf(stderr, "spt_http: connect failed: %s\n", ps_strerror(ps_recent_error()));
         return 1;
     }
     char req[256];
@@ -479,13 +513,24 @@ int main(int argc, char **argv)
     opt.frame_size = kFrame;
     opt.receive_window = 512ull << 20;
     if (strcmp(argv[1], "server") == 0) {
-        int public_body = (argc > 4 && strcmp(argv[4], "public") == 0) ||
-                          (argc > 5 && strcmp(argv[5], "public") == 0);
         uint16_t port = 0;
-        if (argc > 4 && strcmp(argv[4], "public") != 0)
-            port = (uint16_t)atoi(argv[4]);
-        if (public_body)
-            opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+        int saw_port = 0;
+        for (int i = 4; i < argc; i++) {
+            ps_transport_t transport;
+            if (strcmp(argv[i], "public") == 0)
+                opt.min_protection = PS_PROTECTION_AUTHENTICATED;
+            else if (parse_transport(argv[i], &transport))
+                apply_transport(&opt, transport);
+            else if (!saw_port) {
+                port = (uint16_t)atoi(argv[i]);
+                saw_port = 1;
+            } else {
+                usage();
+                return 2;
+            }
+        }
+        if (!transport_available(opt.transport))
+            return 1;
         if (ensure_server_cert(argv[2], argv[3]) != 0)
             return 1;
         return run_server(&opt, port);
@@ -497,15 +542,20 @@ int main(int argc, char **argv)
         }
         int verify = 1;
         for (int i = 7; i < argc; i++) {
+            ps_transport_t transport;
             if (strcmp(argv[i], "public") == 0)
                 opt.min_protection = PS_PROTECTION_AUTHENTICATED;
             else if (strcmp(argv[i], "noverify") == 0 || strcmp(argv[i], "--no-verify") == 0)
                 verify = 0;
+            else if (parse_transport(argv[i], &transport))
+                apply_transport(&opt, transport);
             else {
                 usage();
                 return 2;
             }
         }
+        if (!transport_available(opt.transport))
+            return 1;
         if (access(argv[2], R_OK) != 0 || access(argv[3], R_OK) != 0) {
             fprintf(stderr, "spt_http: certificate %s or key %s is missing\n", argv[2], argv[3]);
             return 1;
