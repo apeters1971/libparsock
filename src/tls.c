@@ -1,11 +1,11 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
+
 #include "tls.h"
 
 #include "log.h"
 #include "spt_wire.h"
 
 #include <string.h>
-
-#include <arpa/inet.h>
 
 #include <openssl/err.h>
 
@@ -100,15 +100,15 @@ int ps_tls_set_peer_name(SSL *ssl, const char *server_name)
         return -1;
     if (SSL_set_tlsext_host_name(ssl, server_name) != 1)
         return -1;
-#if OPENSSL_VERSION_MAJOR >= 4
-    unsigned char addr[16];
-    int v6 = strchr(server_name, ':') != NULL;
-    if (inet_pton(v6 ? AF_INET6 : AF_INET, server_name, addr) == 1)
-        return SSL_set1_ipaddr(ssl, server_name) == 1 ? 0 : -1;
-    return SSL_set1_dnsname(ssl, server_name) == 1 ? 0 : -1;
-#else
-    return SSL_set1_host(ssl, server_name) == 1 ? 0 : -1;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
+    int rc = SSL_set1_host(ssl, server_name);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+    return rc == 1 ? 0 : -1;
 }
 
 SSL *ps_tls_wrap(SSL_CTX *ctx, int fd, int is_server, const char *server_name)
