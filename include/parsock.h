@@ -247,6 +247,41 @@ int ps_session_advice(const ps_session_t *session, struct ps_scale_advice *out);
 int ps_preface_read(int fd, uint8_t session_id[32], uint32_t *subflow_id,
                     int timeout_ms);
 
+/* ========================================================================= */
+/* Device Memory (GPU / DMA-BUF) Extensions                                 */
+/* ========================================================================= */
+
+typedef enum {
+    PS_MEM_HOST = 0,
+    PS_MEM_CUDA = 1,      /* NVIDIA CUDA device pointer */
+    PS_MEM_ROCM = 2,      /* AMD ROCm / HIP device pointer */
+    PS_MEM_DMABUF = 3     /* Linux DMA-BUF file descriptor */
+} ps_mem_type_t;
+
+struct ps_device_mem {
+    ps_mem_type_t type;
+    void         *ptr;         /* GPU virtual address */
+    int           dmabuf_fd;   /* FD if type == PS_MEM_DMABUF, else -1 */
+    size_t        length;
+    uint64_t      offset;
+    void         *internal_mr; /* Opaque struct ibv_mr* cache */
+};
+
+/* Explicitly register a GPU memory region with the RDMA protection domain.
+ * Caches the struct ibv_mr so repeated reads/writes avoid registration latency. */
+int ps_rdma_reg_device_mem(ps_connection_t *conn, struct ps_device_mem *mem);
+
+/* Deregister a previously registered GPU memory region. */
+int ps_rdma_dereg_device_mem(ps_connection_t *conn, struct ps_device_mem *mem);
+
+/* Receive incoming stream data directly into registered GPU memory.
+ * Returns bytes received, or negative -PS_ERR_* code. */
+ssize_t ps_recv_device(ps_connection_t *conn, struct ps_device_mem *dest, size_t length);
+
+/* Transmit data directly from registered GPU memory. */
+ssize_t ps_send_device(ps_connection_t *conn, const struct ps_device_mem *src, size_t length,
+                       ps_protection_t protection);
+
 #ifdef __cplusplus
 }
 #endif

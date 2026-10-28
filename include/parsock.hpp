@@ -87,6 +87,15 @@ enum class session_state : int {
     closed = PS_STATE_CLOSED
 };
 
+enum class mem_type : int {
+    host = PS_MEM_HOST,
+    cuda = PS_MEM_CUDA,
+    rocm = PS_MEM_ROCM,
+    dmabuf = PS_MEM_DMABUF
+};
+
+using device_mem = ::ps_device_mem;
+
 using stats = ::ps_stats;
 using scale_advice = ::ps_scale_advice;
 
@@ -576,6 +585,43 @@ public:
         if (!conn_ || ps_connection_advice(conn_, &out) != 0)
             throw failure(errc::invalid);
         return out;
+    }
+
+    void register_device_mem(device_mem &mem)
+    {
+        if (!conn_)
+            throw failure(errc::invalid);
+        detail::check(ps_rdma_reg_device_mem(conn_, &mem));
+    }
+
+    void deregister_device_mem(device_mem &mem)
+    {
+        if (!conn_)
+            throw failure(errc::invalid);
+        detail::check(ps_rdma_dereg_device_mem(conn_, &mem));
+    }
+
+    std::size_t recv_device(device_mem &dest, std::size_t length)
+    {
+        if (!conn_)
+            throw failure(errc::invalid);
+        const ssize_t n = ps_recv_device(conn_, &dest, length);
+        if (n < 0)
+            throw failure(detail::code_of(n));
+        return static_cast<std::size_t>(n);
+    }
+
+    void send_device(const device_mem &src, std::size_t length, protection profile = protection::authenticated)
+    {
+        if (!conn_)
+            throw failure(errc::invalid);
+        const ssize_t n = ps_send_device(conn_, &src, length, static_cast<ps_protection_t>(profile));
+        if (n < 0)
+            throw failure(detail::code_of(n));
+        if (static_cast<std::size_t>(n) != length) {
+            const int err = ps_connection_error(conn_);
+            throw failure(err > 0 ? err : static_cast<int>(errc::io));
+        }
     }
 
     void close() noexcept { reset(); }

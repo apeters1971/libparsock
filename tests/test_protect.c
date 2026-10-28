@@ -123,8 +123,13 @@ static void *send_main(void *arg)
             chunk = x->total - off;
         for (size_t i = 0; i < chunk; i++)
             buf[i] = pattern(off + i);
+        struct ps_device_mem smem;
+        memset(&smem, 0, sizeof(smem));
+        smem.type = PS_MEM_HOST;
+        smem.ptr = buf;
+        smem.length = chunk;
         ssize_t n = x->authenticated
-                        ? ps_send_protected(x->conn, buf, chunk, PS_PROTECTION_AUTHENTICATED)
+                        ? ps_send_device(x->conn, &smem, chunk, PS_PROTECTION_AUTHENTICATED)
                         : ps_send(x->conn, buf, chunk);
         if (n <= 0) {
             fprintf(stderr, "client send %s\n", ps_strerror(ps_connection_error(x->conn)));
@@ -144,7 +149,12 @@ static void *recv_main(void *arg)
     uint8_t buf[4096];
     size_t off = 0;
     while (off < x->total) {
-        ssize_t n = ps_recv(x->conn, buf, sizeof(buf));
+        struct ps_device_mem dmem;
+        memset(&dmem, 0, sizeof(dmem));
+        dmem.type = PS_MEM_HOST;
+        dmem.ptr = buf;
+        dmem.length = sizeof(buf);
+        ssize_t n = ps_recv_device(x->conn, &dmem, sizeof(buf));
         if (n <= 0) {
             fprintf(stderr, "client recv %s at %zu\n", ps_strerror(ps_connection_error(x->conn)), off);
             x->rc = 1;

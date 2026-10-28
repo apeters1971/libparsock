@@ -4983,6 +4983,17 @@ int ps_session_is_rdma_fd(const ps_session_t *session, int fd)
     return yes;
 }
 
+struct ps_rdma *ps_session_rdma_handle(ps_session_t *session)
+{
+    if (!session)
+        return NULL;
+    struct ps_session *s = (struct ps_session *)session;
+    lock_s(s);
+    struct ps_rdma *r = s->rdma;
+    unlock_s(s);
+    return r;
+}
+
 int ps_session_is_quic_fd(const ps_session_t *session, int fd)
 {
     if (!session || fd < 0)

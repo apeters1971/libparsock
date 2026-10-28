@@ -1,4 +1,5 @@
 #include "session.h"
+#include "rdma.h"
 
 #include "log.h"
 #include "net.h"
@@ -933,4 +934,57 @@ int ps_rekey(ps_connection_t *conn)
     if (!conn)
         return -PS_ERR_INVAL;
     return ps_session_rekey_wait(conn->session, conn->io_timeout_ms);
+}
+
+int ps_rdma_reg_device_mem(ps_connection_t *conn, struct ps_device_mem *mem)
+{
+    if (!conn || !mem || !mem->ptr || mem->length == 0)
+        return -PS_ERR_INVAL;
+    struct ps_rdma *rdma = ps_session_rdma_handle(conn->session);
+    if (!rdma)
+        return -PS_ERR_PROTO;
+    return ps_rdma_register_device_mem(rdma, mem);
+}
+
+int ps_rdma_dereg_device_mem(ps_connection_t *conn, struct ps_device_mem *mem)
+{
+    if (!conn || !mem || !mem->internal_mr)
+        return -PS_ERR_INVAL;
+    struct ps_rdma *rdma = ps_session_rdma_handle(conn->session);
+    if (!rdma)
+        return -PS_ERR_PROTO;
+    return ps_rdma_deregister_device_mem(rdma, mem);
+}
+
+ssize_t ps_recv_device(ps_connection_t *conn, struct ps_device_mem *dest, size_t length)
+{
+    if (!conn || !dest || !dest->ptr || length == 0)
+        return -PS_ERR_INVAL;
+    size_t take_len = length;
+    if (dest->offset + take_len > dest->length) {
+        if (dest->offset >= dest->length)
+            return -PS_ERR_INVAL;
+        take_len = dest->length - dest->offset;
+    }
+    uint8_t *target = (uint8_t *)dest->ptr + dest->offset;
+    ssize_t n = ps_session_recv_wait(conn->session, target, take_len, conn->io_timeout_ms);
+    if (n > 0)
+        dest->offset += (size_t)n;
+    return n;
+}
+
+ssize_t ps_send_device(ps_connection_t *conn, const struct ps_device_mem *src, size_t length,
+                       ps_protection_t protection)
+{
+    if (!conn || !src || !src->ptr || length == 0)
+        return -PS_ERR_INVAL;
+    size_t send_len = length;
+    if (src->offset + send_len > src->length) {
+        if (src->offset >= src->length)
+            return -PS_ERR_INVAL;
+        send_len = src->length - src->offset;
+    }
+    const uint8_t *source = (const uint8_t *)src->ptr + src->offset;
+    return ps_session_send_wait(conn->session, source, send_len, (uint8_t)protection,
+                                conn->io_timeout_ms);
 }

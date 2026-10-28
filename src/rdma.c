@@ -92,6 +92,20 @@ static int depth_ok(unsigned send_depth, unsigned recv_depth, unsigned lanes, si
     return 1;
 }
 
+static int check_gdr_support(struct ibv_context *ctx)
+{
+    if (!ctx)
+        return 0;
+    struct ibv_device_attr attr;
+    if (ibv_query_device(ctx, &attr) != 0)
+        return 0;
+#if defined(__linux__)
+    return access("/sys/kernel/mm/memory_peers/nv_mem", F_OK) == 0 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 static int ensure_device(struct ps_rdma *r, struct ibv_context *ctx)
 {
     if (!ctx)
@@ -118,7 +132,7 @@ static int ensure_device(struct ps_rdma *r, struct ibv_context *ctx)
             ps_notice("rdma completion queue failed");
             return -1;
         }
-        ps_notice("rdma device %s cq=%d", name ? name : "?", cqe);
+        ps_notice("rdma device %s cq=%d gdr=%d", name ? name : "?", cqe, check_gdr_support(ctx));
     }
     if (ctx != r->ctx) {
         ps_notice("rdma connection resolved a different device");
@@ -898,6 +912,39 @@ int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot)
     return rc;
 }
 
+int ps_rdma_register_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem)
+{
+    if (!rdma || !mem || !mem->ptr || mem->length == 0)
+        return -PS_ERR_INVAL;
+    pthread_mutex_lock(&rdma->mu);
+    if (!rdma->pd) {
+        pthread_mutex_unlock(&rdma->mu);
+        return -PS_ERR_PROTO;
+    }
+    int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+    struct ibv_mr *mr = ibv_reg_mr(rdma->pd, mem->ptr, mem->length, access_flags);
+    if (!mr) {
+        ps_notice("GPU ibv_reg_mr failed: %s (ptr=%p len=%zu)", strerror(errno), mem->ptr, mem->length);
+        pthread_mutex_unlock(&rdma->mu);
+        return -PS_ERR_IO;
+    }
+    mem->internal_mr = mr;
+    pthread_mutex_unlock(&rdma->mu);
+    return PS_OK;
+}
+
+int ps_rdma_deregister_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem)
+{
+    if (!rdma || !mem || !mem->internal_mr)
+        return -PS_ERR_INVAL;
+    pthread_mutex_lock(&rdma->mu);
+    struct ibv_mr *mr = (struct ibv_mr *)mem->internal_mr;
+    int rc = ibv_dereg_mr(mr);
+    mem->internal_mr = NULL;
+    pthread_mutex_unlock(&rdma->mu);
+    return rc == 0 ? PS_OK : -PS_ERR_IO;
+}
+
 #else
 
 int ps_rdma_available(void)
@@ -968,6 +1015,20 @@ int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot)
     (void)lane;
     (void)slot;
     return -1;
+}
+
+int ps_rdma_register_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem)
+{
+    (void)rdma;
+    (void)mem;
+    return -PS_ERR_PROTO;
+}
+
+int ps_rdma_deregister_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem)
+{
+    (void)rdma;
+    (void)mem;
+    return -PS_ERR_PROTO;
 }
 
 int ps_rdma_clamp_depths(size_t message, unsigned lanes, unsigned *send_depth, unsigned *recv_depth,

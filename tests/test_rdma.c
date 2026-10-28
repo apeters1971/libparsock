@@ -22,6 +22,37 @@ int main(void)
             fprintf(stderr, "rdma open succeeded without a backend\n");
             return 1;
         }
+        struct ps_device_mem mem;
+        mem.type = PS_MEM_HOST;
+        mem.ptr = &cfg;
+        mem.length = sizeof(cfg);
+        mem.dmabuf_fd = -1;
+        mem.offset = 0;
+        mem.internal_mr = NULL;
+        if (ps_rdma_register_device_mem(NULL, &mem) != -PS_ERR_PROTO) {
+            fprintf(stderr, "rdma reg device mem unexpectedly succeeded or wrong error\n");
+            return 1;
+        }
+        if (ps_rdma_deregister_device_mem(NULL, &mem) != -PS_ERR_PROTO) {
+            fprintf(stderr, "rdma dereg device mem unexpectedly succeeded or wrong error\n");
+            return 1;
+        }
+        if (ps_rdma_reg_device_mem(NULL, &mem) != -PS_ERR_INVAL) {
+            fprintf(stderr, "ps_rdma_reg_device_mem(NULL, ...) expected -PS_ERR_INVAL\n");
+            return 1;
+        }
+        if (ps_rdma_dereg_device_mem(NULL, &mem) != -PS_ERR_INVAL) {
+            fprintf(stderr, "ps_rdma_dereg_device_mem(NULL, ...) expected -PS_ERR_INVAL\n");
+            return 1;
+        }
+        if (ps_recv_device(NULL, &mem, 10) != -PS_ERR_INVAL) {
+            fprintf(stderr, "ps_recv_device(NULL, ...) expected -PS_ERR_INVAL\n");
+            return 1;
+        }
+        if (ps_send_device(NULL, &mem, 10, PS_PROTECTION_AUTHENTICATED) != -PS_ERR_INVAL) {
+            fprintf(stderr, "ps_send_device(NULL, ...) expected -PS_ERR_INVAL\n");
+            return 1;
+        }
     }
     printf("rdma %s\n", available ? "on" : "off");
     return 0;

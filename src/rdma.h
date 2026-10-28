@@ -53,5 +53,7 @@ int ps_rdma_connect(struct ps_rdma *rdma, uint32_t lane, const struct sockaddr *
 int ps_rdma_progress(struct ps_rdma *rdma, struct ps_rdma_event *ev, int max, unsigned budget);
 int ps_rdma_send(struct ps_rdma *rdma, uint32_t lane, const void *data, size_t len);
 int ps_rdma_recycle(struct ps_rdma *rdma, uint32_t lane, unsigned slot);
+int ps_rdma_register_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem);
+int ps_rdma_deregister_device_mem(struct ps_rdma *rdma, struct ps_device_mem *mem);
 
 #endif

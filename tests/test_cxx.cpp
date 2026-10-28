@@ -170,16 +170,24 @@ static void session_case(const parsock::options &opt)
     (void)session.statistics();
     session.service();
     expect(pokes >= 0, "poke callback installed");
-    int fds[2] = {-1, -1};
-    expect(pipe(fds) == 0, "pipe");
-    close(fds[1]);
+
+    int pids[2] = {-1, -1};
+    expect(pipe(pids) == 0, "pipe");
+
+    parsock::device_mem dmem{};
+    dmem.type = PS_MEM_HOST;
+    dmem.ptr = pids;
+    dmem.length = sizeof(pids);
+    dmem.dmabuf_fd = -1;
+    expect(dmem.type == static_cast<ps_mem_type_t>(parsock::mem_type::host), "dmem type");
+    close(pids[1]);
     bool preface_failed = false;
     try {
-        (void)parsock::read_preface(fds[0], 50);
+        (void)parsock::read_preface(pids[0], 50);
     } catch (const parsock::failure &) {
         preface_failed = true;
     }
-    close(fds[0]);
+    close(pids[0]);
     expect(preface_failed, "short preface");
 }
 
