@@ -53,7 +53,42 @@ if(PARSOCK_QUIC)
     find_library(NGTCP2_CRYPTO_LIBRARY ngtcp2_crypto_ossl
                  PATHS /opt/homebrew/lib /usr/local/lib)
     if(NGTCP2_INCLUDE_DIR AND NGTCP2_LIBRARY AND NGTCP2_CRYPTO_LIBRARY)
-        set(PARSOCK_HAVE_QUIC ON)
+        if(CMAKE_CROSSCOMPILING)
+            set(PARSOCK_HAVE_QUIC ON)
+        else()
+            include(CheckCSourceRuns)
+            set(_prev_req_inc ${CMAKE_REQUIRED_INCLUDES})
+            set(_prev_req_lib ${CMAKE_REQUIRED_LIBRARIES})
+            set(CMAKE_REQUIRED_INCLUDES ${NGTCP2_INCLUDE_DIR} ${OPENSSL_INCLUDE_DIR})
+            set(CMAKE_REQUIRED_LIBRARIES ${NGTCP2_CRYPTO_LIBRARY} ${NGTCP2_LIBRARY} OpenSSL::SSL OpenSSL::Crypto)
+            check_c_source_runs("
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#include <openssl/ssl.h>
+int main(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return 1;
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) return 1;
+    ngtcp2_crypto_ossl_ctx *ossl = NULL;
+    if (ngtcp2_crypto_ossl_ctx_new(&ossl, NULL) != 0) return 1;
+    ngtcp2_crypto_ossl_ctx_set_ssl(ossl, ssl);
+    if (ngtcp2_crypto_ossl_configure_client_session(ssl) != 0) return 1;
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    ngtcp2_crypto_ossl_ctx_del(ossl);
+    return 0;
+}
+" NGTCP2_CRYPTO_OSSL_COMPAT)
+            set(CMAKE_REQUIRED_INCLUDES ${_prev_req_inc})
+            set(CMAKE_REQUIRED_LIBRARIES ${_prev_req_lib})
+            if(NGTCP2_CRYPTO_OSSL_COMPAT)
+                set(PARSOCK_HAVE_QUIC ON)
+            else()
+                message(STATUS "libngtcp2_crypto_ossl is incompatible with selected OpenSSL; disabling QUIC")
+            endif()
+        endif()
     endif()
 endif()
 if(PARSOCK_HAVE_QUIC)
