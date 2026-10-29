@@ -10,6 +10,11 @@ enable_language(CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(GNUInstallDirs)
+
+option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # libngtcp2_crypto_ossl is built against one OpenSSL. Prefer that prefix so
 # the process does not load a second libssl. Homebrew's ngtcp2 formula
 # currently links OpenSSL 4; otherwise stay on OpenSSL 3.
@@ -97,7 +102,7 @@ else()
     message(STATUS "libparsock QUIC backend: OFF")
 endif()
 
-add_library(parsock STATIC
+add_library(parsock
     src/log.c
     src/frame.c
     src/crypto.c
@@ -112,6 +117,11 @@ add_library(parsock STATIC
     src/rdma.c
     src/drive.c
     src/standalone.c
+)
+set_target_properties(parsock PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    SOVERSION 0
+    VERSION 0.1.0
 )
 target_include_directories(parsock
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -202,5 +212,11 @@ add_dependencies(spt_bench parsock_test_certs)
 add_test(NAME bench COMMAND spt_bench self-test ${TEST_CERT} ${TEST_KEY})
 set_tests_properties(transfer embed protect cxx bench quic PROPERTIES TIMEOUT 60)
 
-install(TARGETS parsock ARCHIVE DESTINATION lib)
-install(FILES include/parsock.h include/parsock.hpp include/spt_wire.h DESTINATION include)
+install(TARGETS parsock
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(FILES include/parsock.h include/parsock.hpp include/spt_wire.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
